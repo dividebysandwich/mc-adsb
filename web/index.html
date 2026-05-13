@@ -70,7 +70,7 @@
   let radiusCircle = null;
   const markers = new Map(); // hex -> { marker, lastSeen, lastLat, lastLon, history: [] }
   const STALE_MS = 15000;
-  const HISTORY_LEN = 5;
+  const HISTORY_LEN = 10;
 
   function removeEntry(entry) {
     map.removeLayer(entry.marker);
