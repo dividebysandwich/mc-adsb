@@ -68,19 +68,40 @@
 
   let centerMarker = null;
   let radiusCircle = null;
-  const markers = new Map(); // hex -> { marker, lastSeen }
+  const markers = new Map(); // hex -> { marker, lastSeen, lastLat, lastLon, history: [] }
   const STALE_MS = 15000;
+  const HISTORY_LEN = 5;
+
+  function removeEntry(entry) {
+    map.removeLayer(entry.marker);
+    for (const dot of entry.history) map.removeLayer(dot);
+  }
 
   function pruneStale() {
     const now = Date.now();
     for (const [id, entry] of markers) {
       if (now - entry.lastSeen > STALE_MS) {
-        map.removeLayer(entry.marker);
+        removeEntry(entry);
         markers.delete(id);
       }
     }
   }
   setInterval(pruneStale, 1000);
+
+  function pushHistory(entry, lat, lon) {
+    const dot = L.circleMarker([lat, lon], {
+      radius: 2.5,
+      stroke: false,
+      fillColor: '#ffffff',
+      fillOpacity: 0.85,
+      interactive: false,
+      pane: 'overlayPane',
+    }).addTo(map);
+    entry.history.push(dot);
+    while (entry.history.length > HISTORY_LEN) {
+      map.removeLayer(entry.history.shift());
+    }
+  }
 
   // Heli ICAO type designators — used when an aircraft doesn't transmit category A7.
   const HELI_TYPES = new Set(['EC20','EC25','EC30','EC35','EC45','EC55','EC75','EC20T','EC30T',
@@ -307,9 +328,14 @@
           .addTo(map)
           .bindTooltip(labelFor(ac), { permanent: true, direction: 'top', offset: [0, -16], className: 'adsb-label' })
           .bindPopup(popupFor(ac));
-        entry = { marker: marker, lastSeen: now };
+        entry = { marker: marker, lastSeen: now, lastLat: ac.lat, lastLon: ac.lon, history: [] };
         markers.set(id, entry);
       } else {
+        if (entry.lastLat !== ac.lat || entry.lastLon !== ac.lon) {
+          pushHistory(entry, entry.lastLat, entry.lastLon);
+          entry.lastLat = ac.lat;
+          entry.lastLon = ac.lon;
+        }
         entry.marker.setLatLng(latlng);
         entry.marker.setIcon(icon);
         entry.marker.setTooltipContent(labelFor(ac));
