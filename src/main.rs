@@ -33,8 +33,8 @@ struct Args {
     #[arg(long, env = "ADSB_POLL_INTERVAL", default_value_t = 3)]
     poll_interval: u64,
 
-    /// Address to bind the HTTP/WebSocket server to
-    #[arg(long, env = "ADSB_BIND", default_value = "0.0.0.0:8080")]
+    /// Address to bind the HTTP/WebSocket server to (host:port)
+    #[arg(long, env = "ADSB_BIND", default_value = "0.0.0.0:3008")]
     bind: SocketAddr,
 }
 
