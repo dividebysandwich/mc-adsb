@@ -267,7 +267,16 @@
               : (typeof ac.alt_baro === 'number') ? (ac.alt_baro + 'ft')
               : (typeof ac.alt_geom === 'number') ? (ac.alt_geom + 'ft') : '';
     const gs = (typeof ac.gs === 'number') ? Math.round(ac.gs) + 'kt' : '';
-    return [cs, alt, gs].filter(Boolean).join(' · ');
+    const parts = [cs, alt, gs].filter(Boolean);
+    if (ac.mc_alert) {
+      const a = ac.mc_alert;
+      if (a.inside) {
+        parts.push('INSIDE ' + Math.round(a.min_distance_m) + 'm');
+      } else {
+        parts.push('ETA ' + a.eta_s.toFixed(1) + 's @ ' + Math.round(a.min_distance_m) + 'm');
+      }
+    }
+    return parts.join(' · ');
   }
 
   function popupFor(ac) {
