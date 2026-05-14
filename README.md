@@ -95,11 +95,12 @@ unless they are already inside the cylinder.
 curl http://<host>:3008/adsb/simulate
 ```
 
-Spawns (or restarts) a synthetic aircraft `SIM001` that starts 2.5 km north of
-the restricted-area center at 200 ft and ~97 kt. For the first 3 seconds it
-flies due east on a perpendicular course (no intrusion predicted), then turns
-south and continues straight through the cylinder. The aircraft disappears 10
-seconds after exiting; hitting the endpoint again resets it to the start.
+Spawns (or restarts) a synthetic aircraft `SIM001` at 200 ft and ~97 kt. For
+the first 3 seconds it flies due east on a perpendicular course north of the
+restricted area (no intrusion predicted), then rolls into a coordinated 6 °/s
+right-hand turn (~30° bank, rate-2). After rolling out heading due south it
+flies straight through the cylinder. The aircraft disappears 10 seconds after
+exiting; hitting the endpoint again resets it to the start.
 
 ## Frontend behavior
 

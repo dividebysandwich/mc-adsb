@@ -58,17 +58,19 @@ struct AppState {
     sim: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
-/// Simulated aircraft parameters. The aircraft starts `SIM_START_OFFSET_M`
-/// north of the restricted-area center. For the first `SIM_PERPENDICULAR_S`
-/// seconds it flies east (perpendicular to the line to the center, so the
-/// trajectory predictor sees no intrusion), then turns due south and
-/// continues until it has passed through the cylinder. After exit it lingers
-/// for `SIM_LINGER_S` before disappearing.
+/// Simulated aircraft parameters. The aircraft starts north of the
+/// restricted-area center on an east-bound (perpendicular) course. After
+/// `SIM_PERPENDICULAR_S` seconds it begins a coordinated right-hand turn at
+/// `SIM_TURN_RATE_DEG_S` until rolled out heading due south, then flies
+/// straight through the cylinder. The start position is offset west so that
+/// the post-turn track passes through the center. After exit it lingers for
+/// `SIM_LINGER_S` before disappearing.
 const SIM_START_OFFSET_M: f64 = 2500.0;
 const SIM_SPEED_MS: f64 = 50.0; // ≈ 97 kt
 const SIM_ALT_FT: f64 = 200.0;
 const SIM_LINGER_S: f64 = 10.0;
 const SIM_PERPENDICULAR_S: f64 = 3.0;
+const SIM_TURN_RATE_DEG_S: f64 = 6.0; // Rate-2 turn, ~30° bank for a light aircraft
 
 #[derive(Debug, Deserialize)]
 struct AdsbResponse {
@@ -303,26 +305,47 @@ async fn simulated_aircraft(
     let started = (*guard)?;
     let t = started.elapsed().as_secs_f64();
 
-    // x_off is the constant east offset that accumulates during the
-    // perpendicular leg; the southbound leg then flies a line offset by x_off
-    // from the center, so the aircraft must still travel inside the cylinder.
-    let x_off = SIM_PERPENDICULAR_S * SIM_SPEED_MS;
-    // Half-chord through the cylinder along that offset line.
-    let half_chord = (r.radius_m * r.radius_m - x_off * x_off).max(0.0).sqrt();
-    let exit_t = SIM_PERPENDICULAR_S + (SIM_START_OFFSET_M + half_chord) / SIM_SPEED_MS;
+    // Turn geometry: a 90° right-hand turn at SIM_TURN_RATE_DEG_S sweeps an
+    // arc of radius v/ω and takes 90°/ω seconds.
+    let turn_rate_rad = SIM_TURN_RATE_DEG_S.to_radians();
+    let turn_radius = SIM_SPEED_MS / turn_rate_rad;
+    let turn_duration = std::f64::consts::FRAC_PI_2 / turn_rate_rad;
+
+    // Local equirectangular frame: +x east, +y north. To make the post-turn
+    // southbound leg pass through (0, 0), back the start position west so
+    // that east-leg drift plus arc displacement zeroes out at rollout.
+    let perp_dx = SIM_PERPENDICULAR_S * SIM_SPEED_MS;
+    let x_start = -(perp_dx + turn_radius);
+    let y_start = SIM_START_OFFSET_M;
+    let x_perp_end = x_start + perp_dx; // = -turn_radius
+    let arc_cx = x_perp_end;
+    let arc_cy = y_start - turn_radius;
+    let rollout_y = y_start - turn_radius;
+
+    let exit_t = SIM_PERPENDICULAR_S
+        + turn_duration
+        + (rollout_y + r.radius_m) / SIM_SPEED_MS;
     let lifetime = exit_t + SIM_LINGER_S;
     if t > lifetime {
         *guard = None;
         return None;
     }
 
-    // Local equirectangular frame centered on the restricted area. +x is east,
-    // +y is north. Phase 1: fly east. Phase 2: turn south, x stays at x_off.
     let (x_m, y_m, track_deg) = if t < SIM_PERPENDICULAR_S {
-        (SIM_SPEED_MS * t, SIM_START_OFFSET_M, 90.0)
+        // Phase 1: straight east on a perpendicular course.
+        (x_start + SIM_SPEED_MS * t, y_start, 90.0)
+    } else if t < SIM_PERPENDICULAR_S + turn_duration {
+        // Phase 2: coordinated right turn from 090° to 180°.
+        let s = t - SIM_PERPENDICULAR_S;
+        let alpha = turn_rate_rad * s;
+        let x = arc_cx + turn_radius * alpha.sin();
+        let y = arc_cy + turn_radius * alpha.cos();
+        let track = 90.0 + SIM_TURN_RATE_DEG_S * s;
+        (x, y, track)
     } else {
-        let dt = t - SIM_PERPENDICULAR_S;
-        (x_off, SIM_START_OFFSET_M - SIM_SPEED_MS * dt, 180.0)
+        // Phase 3: straight south through the cylinder.
+        let s = t - SIM_PERPENDICULAR_S - turn_duration;
+        (0.0, rollout_y - SIM_SPEED_MS * s, 180.0)
     };
     let m_per_deg_lat = 111_320.0_f64;
     let m_per_deg_lon = 111_320.0_f64 * r.lat.to_radians().cos();
