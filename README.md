@@ -89,6 +89,17 @@ The prediction is a straight-line extrapolation of the current `lat`/`lon`
 along `track` at `gs`. Aircraft without a valid `gs`/`track` are not alerted
 unless they are already inside the cylinder.
 
+## Simulating an intrusion
+
+```
+curl http://<host>:3008/adsb/simulate
+```
+
+Spawns (or restarts) a synthetic aircraft `SIM001` that starts 2.5 km north of
+the restricted-area center at 200 ft, flies due south at ~97 kt through the
+cylinder, and disappears 10 seconds after exiting. Hitting the endpoint again
+while it is still flying resets it to the start.
+
 ## Frontend behavior
 
 - The adsb.lol query radius is drawn as a faint blue circle.

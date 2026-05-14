@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -55,7 +55,18 @@ struct AppState {
     tx: broadcast::Sender<String>,
     latest: Arc<tokio::sync::RwLock<Option<String>>>,
     args: Args,
+    sim: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
+
+/// Simulated aircraft parameters. The aircraft starts `SIM_START_OFFSET_M`
+/// north of the restricted-area center, heading due south at `SIM_SPEED_MS`,
+/// so it enters the cylinder at `t = (SIM_START_OFFSET_M - radius) / SPEED`
+/// and exits at `t = (SIM_START_OFFSET_M + radius) / SPEED`. After exit it
+/// lingers for `SIM_LINGER_S` before disappearing.
+const SIM_START_OFFSET_M: f64 = 2500.0;
+const SIM_SPEED_MS: f64 = 50.0; // ≈ 97 kt
+const SIM_ALT_FT: f64 = 200.0;
+const SIM_LINGER_S: f64 = 10.0;
 
 #[derive(Debug, Deserialize)]
 struct AdsbResponse {
@@ -128,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         tx: tx.clone(),
         latest: Arc::new(tokio::sync::RwLock::new(None)),
         args: args.clone(),
+        sim: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     let poller_state = state.clone();
@@ -141,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/adsb", get(index))
         .route("/adsb/", get(index))
         .route("/adsb/ws", get(ws_handler))
+        .route("/adsb/simulate", get(simulate))
         .route("/adsb/healthz", get(|| async { "ok" }))
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -178,8 +191,12 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
         ticker.tick().await;
         match fetch(&client, &url).await {
             Ok(payload) => {
+                let mut ac = payload.ac;
+                if let Some(sim_ac) = simulated_aircraft(&state, &restricted).await {
+                    ac.push(sim_ac);
+                }
                 let aircraft = annotate_aircraft(
-                    payload.ac,
+                    ac,
                     &restricted,
                     state.args.predict_horizon_s,
                 );
@@ -225,6 +242,13 @@ async fn index() -> impl IntoResponse {
     Html(include_str!("../web/index.html"))
 }
 
+async fn simulate(State(state): State<AppState>) -> impl IntoResponse {
+    let mut guard = state.sim.lock().await;
+    *guard = Some(Instant::now());
+    tracing::info!("simulated aircraft SIM001 (re)started");
+    "started"
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -263,6 +287,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
+}
+
+/// Returns a synthesized SIM001 aircraft record if a simulation is currently
+/// active. The aircraft starts north of the restricted area, flies due south
+/// through it, then lingers `SIM_LINGER_S` after exiting before disappearing.
+/// Clears the sim state once the lifetime is exceeded.
+async fn simulated_aircraft(
+    state: &AppState,
+    r: &RestrictedArea,
+) -> Option<serde_json::Value> {
+    let mut guard = state.sim.lock().await;
+    let started = (*guard)?;
+    let t = started.elapsed().as_secs_f64();
+
+    let exit_t = (SIM_START_OFFSET_M + r.radius_m) / SIM_SPEED_MS;
+    let lifetime = exit_t + SIM_LINGER_S;
+    if t > lifetime {
+        *guard = None;
+        return None;
+    }
+
+    // Local equirectangular frame centered on the restricted area: aircraft
+    // travels along -y (south). Offset starts at +SIM_START_OFFSET_M.
+    let y_m = SIM_START_OFFSET_M - SIM_SPEED_MS * t;
+    let m_per_deg_lat = 111_320.0_f64;
+    let m_per_deg_lon = 111_320.0_f64 * r.lat.to_radians().cos();
+    let lat = r.lat + y_m / m_per_deg_lat;
+    let lon = r.lon + 0.0 / m_per_deg_lon;
+
+    Some(serde_json::json!({
+        "hex": "SIM001",
+        "flight": "SIM001  ",
+        "r": "SIM001",
+        "t": "SIMA",
+        "lat": lat,
+        "lon": lon,
+        "alt_baro": SIM_ALT_FT,
+        "gs": SIM_SPEED_MS / 0.514_444,
+        "track": 180.0,
+        "category": "A1",
+    }))
 }
 
 /// Adds an `mc_alert` field to each aircraft that is predicted to enter the
