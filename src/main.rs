@@ -59,14 +59,16 @@ struct AppState {
 }
 
 /// Simulated aircraft parameters. The aircraft starts `SIM_START_OFFSET_M`
-/// north of the restricted-area center, heading due south at `SIM_SPEED_MS`,
-/// so it enters the cylinder at `t = (SIM_START_OFFSET_M - radius) / SPEED`
-/// and exits at `t = (SIM_START_OFFSET_M + radius) / SPEED`. After exit it
-/// lingers for `SIM_LINGER_S` before disappearing.
+/// north of the restricted-area center. For the first `SIM_PERPENDICULAR_S`
+/// seconds it flies east (perpendicular to the line to the center, so the
+/// trajectory predictor sees no intrusion), then turns due south and
+/// continues until it has passed through the cylinder. After exit it lingers
+/// for `SIM_LINGER_S` before disappearing.
 const SIM_START_OFFSET_M: f64 = 2500.0;
 const SIM_SPEED_MS: f64 = 50.0; // ≈ 97 kt
 const SIM_ALT_FT: f64 = 200.0;
 const SIM_LINGER_S: f64 = 10.0;
+const SIM_PERPENDICULAR_S: f64 = 3.0;
 
 #[derive(Debug, Deserialize)]
 struct AdsbResponse {
@@ -301,20 +303,31 @@ async fn simulated_aircraft(
     let started = (*guard)?;
     let t = started.elapsed().as_secs_f64();
 
-    let exit_t = (SIM_START_OFFSET_M + r.radius_m) / SIM_SPEED_MS;
+    // x_off is the constant east offset that accumulates during the
+    // perpendicular leg; the southbound leg then flies a line offset by x_off
+    // from the center, so the aircraft must still travel inside the cylinder.
+    let x_off = SIM_PERPENDICULAR_S * SIM_SPEED_MS;
+    // Half-chord through the cylinder along that offset line.
+    let half_chord = (r.radius_m * r.radius_m - x_off * x_off).max(0.0).sqrt();
+    let exit_t = SIM_PERPENDICULAR_S + (SIM_START_OFFSET_M + half_chord) / SIM_SPEED_MS;
     let lifetime = exit_t + SIM_LINGER_S;
     if t > lifetime {
         *guard = None;
         return None;
     }
 
-    // Local equirectangular frame centered on the restricted area: aircraft
-    // travels along -y (south). Offset starts at +SIM_START_OFFSET_M.
-    let y_m = SIM_START_OFFSET_M - SIM_SPEED_MS * t;
+    // Local equirectangular frame centered on the restricted area. +x is east,
+    // +y is north. Phase 1: fly east. Phase 2: turn south, x stays at x_off.
+    let (x_m, y_m, track_deg) = if t < SIM_PERPENDICULAR_S {
+        (SIM_SPEED_MS * t, SIM_START_OFFSET_M, 90.0)
+    } else {
+        let dt = t - SIM_PERPENDICULAR_S;
+        (x_off, SIM_START_OFFSET_M - SIM_SPEED_MS * dt, 180.0)
+    };
     let m_per_deg_lat = 111_320.0_f64;
     let m_per_deg_lon = 111_320.0_f64 * r.lat.to_radians().cos();
     let lat = r.lat + y_m / m_per_deg_lat;
-    let lon = r.lon + 0.0 / m_per_deg_lon;
+    let lon = r.lon + x_m / m_per_deg_lon;
 
     Some(serde_json::json!({
         "hex": "SIM001",
@@ -325,7 +338,7 @@ async fn simulated_aircraft(
         "lon": lon,
         "alt_baro": SIM_ALT_FT,
         "gs": SIM_SPEED_MS / 0.514_444,
-        "track": 180.0,
+        "track": track_deg,
         "category": "A1",
     }))
 }

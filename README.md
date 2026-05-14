@@ -96,9 +96,10 @@ curl http://<host>:3008/adsb/simulate
 ```
 
 Spawns (or restarts) a synthetic aircraft `SIM001` that starts 2.5 km north of
-the restricted-area center at 200 ft, flies due south at ~97 kt through the
-cylinder, and disappears 10 seconds after exiting. Hitting the endpoint again
-while it is still flying resets it to the start.
+the restricted-area center at 200 ft and ~97 kt. For the first 3 seconds it
+flies due east on a perpendicular course (no intrusion predicted), then turns
+south and continues straight through the cylinder. The aircraft disappears 10
+seconds after exiting; hitting the endpoint again resets it to the start.
 
 ## Frontend behavior
 
