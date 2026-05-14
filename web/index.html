@@ -37,6 +37,11 @@
     border: none; box-shadow: none; white-space: nowrap;
   }
   .leaflet-tooltip-top.adsb-label::before { display: none; }
+  /* Alerted aircraft: flash white-on-red 2 Hz (toggled by JS every 250 ms). */
+  .adsb-label.alert-on {
+    background: #dc2626 !important;
+    color: #ffffff !important;
+  }
 </style>
 </head>
 <body>
@@ -68,7 +73,9 @@
 
   let centerMarker = null;
   let radiusCircle = null;
-  const markers = new Map(); // hex -> { marker, lastSeen, lastLat, lastLon, history: [] }
+  let restrictedCircle = null;
+  const markers = new Map(); // hex -> { marker, lastSeen, lastLat, lastLon, history: [], alert }
+  const alertedIds = new Set();
   const STALE_MS = 15000;
   const HISTORY_LEN = 10;
 
@@ -83,10 +90,27 @@
       if (now - entry.lastSeen > STALE_MS) {
         removeEntry(entry);
         markers.delete(id);
+        alertedIds.delete(id);
       }
     }
   }
   setInterval(pruneStale, 1000);
+
+  // 2 Hz flash: toggle the `alert-on` class on every alerted aircraft's label
+  // every 250 ms (one on/off cycle every 500 ms = 2 Hz).
+  let alertFlashOn = false;
+  setInterval(function () {
+    alertFlashOn = !alertFlashOn;
+    for (const id of alertedIds) {
+      const entry = markers.get(id);
+      if (!entry) continue;
+      const tip = entry.marker.getTooltip && entry.marker.getTooltip();
+      const el = tip && tip.getElement && tip.getElement();
+      if (!el) continue;
+      if (alertFlashOn) el.classList.add('alert-on');
+      else el.classList.remove('alert-on');
+    }
+  }, 250);
 
   function pushHistory(entry, lat, lon) {
     const dot = L.circleMarker([lat, lon], {
@@ -311,6 +335,26 @@
       }
     }
 
+    if (snap.restricted && typeof snap.restricted.radius_m === 'number') {
+      const r = snap.restricted;
+      if (!restrictedCircle) {
+        restrictedCircle = L.circle([r.lat, r.lon], {
+          radius: r.radius_m,
+          color: '#ef4444',
+          weight: 2,
+          fillColor: '#ef4444',
+          fillOpacity: 0.12,
+        }).addTo(map);
+        restrictedCircle.bindTooltip(
+          'Restricted: ' + r.radius_m + ' m radius, ≤ ' + r.altitude_ft + ' ft',
+          { direction: 'top', sticky: true }
+        );
+      } else {
+        restrictedCircle.setLatLng([r.lat, r.lon]);
+        restrictedCircle.setRadius(r.radius_m);
+      }
+    }
+
     const now = Date.now();
     const seen = new Set();
     const list = snap.aircraft || [];
@@ -328,7 +372,7 @@
           .addTo(map)
           .bindTooltip(labelFor(ac), { permanent: true, direction: 'top', offset: [0, -16], className: 'adsb-label' })
           .bindPopup(popupFor(ac));
-        entry = { marker: marker, lastSeen: now, lastLat: ac.lat, lastLon: ac.lon, history: [] };
+        entry = { marker: marker, lastSeen: now, lastLat: ac.lat, lastLon: ac.lon, history: [], alert: !!ac.mc_alert };
         markers.set(id, entry);
       } else {
         if (entry.lastLat !== ac.lat || entry.lastLon !== ac.lon) {
@@ -341,7 +385,10 @@
         entry.marker.setTooltipContent(labelFor(ac));
         if (entry.marker.isPopupOpen()) entry.marker.setPopupContent(popupFor(ac));
         entry.lastSeen = now;
+        entry.alert = !!ac.mc_alert;
       }
+      if (entry.alert) alertedIds.add(id);
+      else alertedIds.delete(id);
     }
 
     pruneStale();

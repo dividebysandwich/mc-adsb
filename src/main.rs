@@ -36,6 +36,18 @@ struct Args {
     /// Address to bind the HTTP/WebSocket server to (host:port)
     #[arg(long, env = "ADSB_BIND", default_value = "0.0.0.0:3008")]
     bind: SocketAddr,
+
+    /// Radius of the restricted area in meters, centered on lat/lon.
+    #[arg(long, env = "ADSB_RESTRICTED_RADIUS_M", default_value_t = 500.0)]
+    restricted_radius_m: f64,
+
+    /// Upper altitude bound (feet) for the restricted area. Aircraft above this are not alerted.
+    #[arg(long, env = "ADSB_RESTRICTED_ALT_FT", default_value_t = 400.0)]
+    restricted_alt_ft: f64,
+
+    /// How far ahead (seconds) to project each aircraft's trajectory when checking intrusion.
+    #[arg(long, env = "ADSB_PREDICT_HORIZON_S", default_value_t = 60.0)]
+    predict_horizon_s: f64,
 }
 
 #[derive(Clone)]
@@ -56,18 +68,37 @@ struct AdsbResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct Snapshot<'a> {
+struct Snapshot {
     center: Center,
     radius_nm: u32,
+    restricted: RestrictedArea,
     now: Option<u64>,
     total: Option<u64>,
-    aircraft: &'a [serde_json::Value],
+    aircraft: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 struct Center {
     lat: f64,
     lon: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RestrictedArea {
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+    altitude_ft: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct AlertInfo {
+    /// Closest predicted distance (meters) from the restricted-area center within the horizon.
+    min_distance_m: f64,
+    /// Seconds until that closest approach (0 if already inside).
+    eta_s: f64,
+    /// Whether the aircraft is currently inside the restricted cylinder.
+    inside: bool,
 }
 
 #[tokio::main]
@@ -81,12 +112,15 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     tracing::info!(
-        "starting mc-adsb: lat={}, lon={}, radius={}nm, poll={}s, bind={}",
+        "starting mc-adsb: lat={}, lon={}, radius={}nm, poll={}s, bind={}, restricted=(r={}m, alt<={}ft, horizon={}s)",
         args.lat,
         args.lon,
         args.radius,
         args.poll_interval,
-        args.bind
+        args.bind,
+        args.restricted_radius_m,
+        args.restricted_alt_ft,
+        args.predict_horizon_s,
     );
 
     let (tx, _rx) = broadcast::channel::<String>(64);
@@ -133,27 +167,41 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let restricted = RestrictedArea {
+        lat: state.args.lat,
+        lon: state.args.lon,
+        radius_m: state.args.restricted_radius_m,
+        altitude_ft: state.args.restricted_alt_ft,
+    };
+
     loop {
         ticker.tick().await;
         match fetch(&client, &url).await {
             Ok(payload) => {
+                let aircraft = annotate_aircraft(
+                    payload.ac,
+                    &restricted,
+                    state.args.predict_horizon_s,
+                );
                 let snapshot = Snapshot {
                     center: Center {
                         lat: state.args.lat,
                         lon: state.args.lon,
                     },
                     radius_nm: state.args.radius,
+                    restricted: restricted.clone(),
                     now: payload.now,
                     total: payload.total,
-                    aircraft: &payload.ac,
+                    aircraft,
                 };
+                let count = snapshot.aircraft.len();
                 let json = serde_json::to_string(&snapshot)?;
                 {
                     let mut latest = state.latest.write().await;
                     *latest = Some(json.clone());
                 }
                 let _ = state.tx.send(json);
-                tracing::debug!("broadcast {} aircraft", payload.ac.len());
+                tracing::debug!("broadcast {} aircraft", count);
             }
             Err(e) => {
                 tracing::warn!("fetch failed: {e:#}");
@@ -214,5 +262,98 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     tokio::select! {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
+    }
+}
+
+/// Adds an `mc_alert` field to each aircraft that is predicted to enter the
+/// restricted cylinder within the prediction horizon.
+fn annotate_aircraft(
+    mut aircraft: Vec<serde_json::Value>,
+    restricted: &RestrictedArea,
+    horizon_s: f64,
+) -> Vec<serde_json::Value> {
+    for ac in aircraft.iter_mut() {
+        if let Some(alert) = predict_intrusion(ac, restricted, horizon_s) {
+            if let Some(obj) = ac.as_object_mut() {
+                obj.insert(
+                    "mc_alert".to_string(),
+                    serde_json::to_value(alert).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+    }
+    aircraft
+}
+
+/// Returns Some(AlertInfo) if the aircraft is predicted to enter the restricted
+/// cylinder (radius_m, at or below altitude_ft) within `horizon_s` seconds.
+fn predict_intrusion(
+    ac: &serde_json::Value,
+    r: &RestrictedArea,
+    horizon_s: f64,
+) -> Option<AlertInfo> {
+    let lat = ac.get("lat")?.as_f64()?;
+    let lon = ac.get("lon")?.as_f64()?;
+
+    // Altitude gate: ignore aircraft known to be above the restricted ceiling.
+    // alt_baro may be "ground", a number, or missing. alt_geom is a fallback.
+    let alt_ft = match ac.get("alt_baro") {
+        Some(serde_json::Value::String(s)) if s == "ground" => 0.0,
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(f64::INFINITY),
+        _ => match ac.get("alt_geom").and_then(|v| v.as_f64()) {
+            Some(v) => v,
+            None => f64::INFINITY,
+        },
+    };
+    if alt_ft > r.altitude_ft {
+        return None;
+    }
+
+    // Local equirectangular projection centered on the restricted-area center.
+    // The restricted area is small (hundreds of meters), so this is accurate enough.
+    let lat_rad = r.lat.to_radians();
+    let m_per_deg_lat = 111_320.0_f64;
+    let m_per_deg_lon = 111_320.0_f64 * lat_rad.cos();
+
+    let x0 = (lon - r.lon) * m_per_deg_lon;
+    let y0 = (lat - r.lat) * m_per_deg_lat;
+    let dist0 = (x0 * x0 + y0 * y0).sqrt();
+
+    // Already inside the cylinder.
+    if dist0 <= r.radius_m {
+        return Some(AlertInfo {
+            min_distance_m: dist0,
+            eta_s: 0.0,
+            inside: true,
+        });
+    }
+
+    // Need a velocity to project forward.
+    let gs_kt = ac.get("gs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let track_deg = ac.get("track").and_then(|v| v.as_f64());
+    if gs_kt <= 0.0 || track_deg.is_none() {
+        return None;
+    }
+    let gs_ms = gs_kt * 0.514_444;
+    let track_rad = track_deg.unwrap().to_radians();
+    let vx = gs_ms * track_rad.sin();
+    let vy = gs_ms * track_rad.cos();
+
+    // Closest approach of the ray (p + t*v) to the origin, t >= 0.
+    let v2 = vx * vx + vy * vy;
+    let t_closest = -(x0 * vx + y0 * vy) / v2;
+    let t_eval = t_closest.clamp(0.0, horizon_s);
+    let cx = x0 + vx * t_eval;
+    let cy = y0 + vy * t_eval;
+    let min_distance = (cx * cx + cy * cy).sqrt();
+
+    if min_distance <= r.radius_m {
+        Some(AlertInfo {
+            min_distance_m: min_distance,
+            eta_s: t_eval,
+            inside: false,
+        })
+    } else {
+        None
     }
 }

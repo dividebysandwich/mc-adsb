@@ -1,2 +1,96 @@
 # mc-adsb
-ADS-B visualization for RC club
+
+ADS-B visualization for an RC club. A small Rust service polls
+[adsb.lol](https://adsb.lol) for traffic around a fixed point and rebroadcasts
+it to a browser over a WebSocket, together with a configurable cylindrical
+restricted area and per-aircraft trajectory-intrusion alerts.
+
+## Run
+
+```
+cargo run --release
+```
+
+Useful flags (also available as env vars, see `--help`):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--lat` / `--lon` | 48.2082 / 16.3738 | Center of the search and the restricted area |
+| `--radius` | 100 | adsb.lol query radius (nm) |
+| `--poll-interval` | 3 | Seconds between adsb.lol polls |
+| `--bind` | 0.0.0.0:3008 | HTTP/WebSocket listen address |
+| `--restricted-radius-m` | 500 | Restricted-area radius in meters |
+| `--restricted-alt-ft` | 400 | Restricted-area ceiling in feet (aircraft above are ignored) |
+| `--predict-horizon-s` | 60 | How far ahead to project each aircraft's straight-line path |
+
+Open `http://<host>:3008/adsb/` in a browser.
+
+## WebSocket payload
+
+The server pushes one JSON message per poll on `/adsb/ws`. The newest snapshot
+is also sent immediately on connect. Every message has the same shape:
+
+```jsonc
+{
+  "center":   { "lat": 48.2082, "lon": 16.3738 },
+  "radius_nm": 100,                       // adsb.lol query radius (nm)
+  "restricted": {
+    "lat": 48.2082,                       // restricted-area center
+    "lon": 16.3738,
+    "radius_m": 500.0,                    // restricted-area radius (meters)
+    "altitude_ft": 400.0                  // ceiling — aircraft above are not checked
+  },
+  "now":   1715680000,                    // server timestamp from adsb.lol (epoch s, optional)
+  "total": 42,                            // total aircraft adsb.lol saw (optional)
+  "aircraft": [ /* see below */ ]
+}
+```
+
+### Aircraft entries
+
+Each entry in `aircraft[]` is the **raw adsb.lol record** (the `ac[]` objects
+from the [adsb.lol v2 API](https://api.adsb.lol/)) passed through unmodified.
+The fields the frontend uses are:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `hex` | string | ICAO 24-bit address — used as the stable id |
+| `flight` | string | Callsign (may be padded with spaces) |
+| `r` | string | Registration |
+| `t` | string | ICAO type designator |
+| `lat`, `lon` | number | Position (degrees) |
+| `alt_baro` | number \| `"ground"` | Barometric altitude (ft) |
+| `alt_geom` | number | Geometric altitude (ft), used as a fallback |
+| `gs` | number | Ground speed (knots) |
+| `track` | number | True track (degrees, 0=N, clockwise) |
+| `baro_rate` | number | Vertical speed (ft/min) |
+| `squawk`, `category` | string | Standard ADS-B fields |
+
+Records with missing `lat`/`lon` are still passed through; the frontend skips
+drawing them.
+
+### Alert annotation (`mc_alert`)
+
+mc-adsb adds **one extra field**, `mc_alert`, to every aircraft that is
+predicted to enter the restricted cylinder within `--predict-horizon-s`
+seconds **and** whose altitude is at or below `--restricted-alt-ft`. The field
+is omitted entirely on aircraft that are not alerting.
+
+```jsonc
+"mc_alert": {
+  "min_distance_m": 320.4,   // minimum predicted distance from the center (m)
+                             // along the straight-line projection
+  "eta_s": 18.5,             // seconds until closest approach (0 if already inside)
+  "inside": false            // true if the aircraft is currently inside the cylinder
+}
+```
+
+The prediction is a straight-line extrapolation of the current `lat`/`lon`
+along `track` at `gs`. Aircraft without a valid `gs`/`track` are not alerted
+unless they are already inside the cylinder.
+
+## Frontend behavior
+
+- The adsb.lol query radius is drawn as a faint blue circle.
+- The restricted area is drawn as a red filled circle.
+- Aircraft labels flash white-on-red at 2 Hz when `mc_alert` is present.
