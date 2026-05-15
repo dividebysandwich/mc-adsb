@@ -312,6 +312,7 @@
         const bounds = L.latLng(snap.center.lat, snap.center.lon)
           .toBounds(snap.radius_nm * 1852 * 2);
         map.fitBounds(bounds, { padding: [20, 20] });
+        map.setZoom(map.getZoom() + 2);
       } else {
         map.setView([snap.center.lat, snap.center.lon], map.getZoom());
       }
