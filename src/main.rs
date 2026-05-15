@@ -170,9 +170,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn poll_loop(state: AppState) -> anyhow::Result<()> {
+    // Per-request timeout of 1s: adsb.lol is sometimes slow, and the API caps
+    // us at 1 req/sec anyway, so a stuck request must not be allowed to stall
+    // or pile up behind subsequent attempts.
     let client = reqwest::Client::builder()
         .user_agent("mc-adsb/0.1")
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(1))
         .build()?;
 
     let interval = Duration::from_secs(state.args.poll_interval.max(1));
@@ -181,9 +184,6 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
         state.args.lat, state.args.lon, state.args.radius
     );
 
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     let restricted = RestrictedArea {
         lat: state.args.lat,
         lon: state.args.lon,
@@ -191,43 +191,62 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
         altitude_ft: state.args.restricted_alt_ft,
     };
 
+    let backoff_max = Duration::from_secs(10);
+    let mut backoff = Duration::ZERO;
+
     loop {
-        ticker.tick().await;
-        match fetch(&client, &url).await {
+        tokio::time::sleep(interval + backoff).await;
+        let (ac_upstream, now, total) = match fetch(&client, &url).await {
             Ok(payload) => {
-                let mut ac = payload.ac;
-                if let Some(sim_ac) = simulated_aircraft(&state, &restricted).await {
-                    ac.push(sim_ac);
-                }
-                let aircraft = annotate_aircraft(
-                    ac,
-                    &restricted,
-                    state.args.predict_horizon_s,
-                );
-                let snapshot = Snapshot {
-                    center: Center {
-                        lat: state.args.lat,
-                        lon: state.args.lon,
-                    },
-                    radius_nm: state.args.radius,
-                    restricted: restricted.clone(),
-                    now: payload.now,
-                    total: payload.total,
-                    aircraft,
-                };
-                let count = snapshot.aircraft.len();
-                let json = serde_json::to_string(&snapshot)?;
-                {
-                    let mut latest = state.latest.write().await;
-                    *latest = Some(json.clone());
-                }
-                let _ = state.tx.send(json);
-                tracing::debug!("broadcast {} aircraft", count);
+                backoff = Duration::ZERO;
+                (payload.ac, payload.now, payload.total)
             }
             Err(e) => {
-                tracing::warn!("fetch failed: {e:#}");
+                backoff = if backoff.is_zero() {
+                    Duration::from_secs(1)
+                } else {
+                    (backoff * 2).min(backoff_max)
+                };
+                tracing::warn!("fetch failed (next retry in {}s): {e:#}", (interval + backoff).as_secs());
+                (Vec::new(), None, None)
             }
+        };
+
+        let mut ac = ac_upstream;
+        let sim_active = if let Some(sim_ac) = simulated_aircraft(&state, &restricted).await {
+            ac.push(sim_ac);
+            true
+        } else {
+            false
+        };
+
+        // Skip the broadcast when both upstream is dead and sim is idle —
+        // there is nothing new to say, and the existing `latest` snapshot
+        // stays available for new WebSocket clients.
+        if ac.is_empty() && !sim_active && now.is_none() {
+            continue;
         }
+
+        let aircraft = annotate_aircraft(ac, &restricted, state.args.predict_horizon_s);
+        let snapshot = Snapshot {
+            center: Center {
+                lat: state.args.lat,
+                lon: state.args.lon,
+            },
+            radius_nm: state.args.radius,
+            restricted: restricted.clone(),
+            now,
+            total,
+            aircraft,
+        };
+        let count = snapshot.aircraft.len();
+        let json = serde_json::to_string(&snapshot)?;
+        {
+            let mut latest = state.latest.write().await;
+            *latest = Some(json.clone());
+        }
+        let _ = state.tx.send(json);
+        tracing::debug!("broadcast {} aircraft", count);
     }
 }
 
