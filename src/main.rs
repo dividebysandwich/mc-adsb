@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,7 +57,19 @@ struct AppState {
     latest: Arc<tokio::sync::RwLock<Option<String>>>,
     args: Args,
     sim: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    history: Arc<tokio::sync::RwLock<HashMap<String, Trail>>>,
 }
+
+struct Trail {
+    /// Previously-reported positions, oldest first. The current position is
+    /// tracked separately in `last_pos` and is *not* included here.
+    positions: VecDeque<(f64, f64)>,
+    last_pos: Option<(f64, f64)>,
+    last_seen: Instant,
+}
+
+const HISTORY_LEN: usize = 10;
+const HISTORY_STALE_S: u64 = 30;
 
 /// Simulated aircraft parameters. The aircraft starts north of the
 /// restricted-area center on an east-bound (perpendicular) course. After
@@ -144,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         latest: Arc::new(tokio::sync::RwLock::new(None)),
         args: args.clone(),
         sim: Arc::new(tokio::sync::Mutex::new(None)),
+        history: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
     };
 
     let poller_state = state.clone();
@@ -227,6 +241,7 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
             continue;
         }
 
+        update_history(&state.history, &mut ac).await;
         let aircraft = annotate_aircraft(ac, &restricted, state.args.predict_horizon_s);
         let snapshot = Snapshot {
             center: Center {
@@ -268,8 +283,70 @@ async fn index() -> impl IntoResponse {
 async fn simulate(State(state): State<AppState>) -> impl IntoResponse {
     let mut guard = state.sim.lock().await;
     *guard = Some(Instant::now());
+    // Drop any stale trail from a prior run so the restarted aircraft does
+    // not appear to be connected to its previous track.
+    state.history.write().await.remove("SIM001");
     tracing::info!("simulated aircraft SIM001 (re)started");
     "started"
+}
+
+/// Updates the per-aircraft trail map in place and injects an `mc_history`
+/// array on each aircraft. The injected list holds previous positions only,
+/// oldest first — the current `lat`/`lon` is not duplicated. Entries for
+/// aircraft not seen this tick are pruned after `HISTORY_STALE_S`.
+async fn update_history(
+    history: &Arc<tokio::sync::RwLock<HashMap<String, Trail>>>,
+    aircraft: &mut [serde_json::Value],
+) {
+    let now = Instant::now();
+    let mut hist = history.write().await;
+
+    for ac in aircraft.iter_mut() {
+        let id = ac
+            .get("hex")
+            .and_then(|v| v.as_str())
+            .or_else(|| ac.get("r").and_then(|v| v.as_str()))
+            .or_else(|| ac.get("flight").and_then(|v| v.as_str()))
+            .map(|s| s.trim().to_string());
+        let id = match id.filter(|s| !s.is_empty()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let lat = ac.get("lat").and_then(|v| v.as_f64());
+        let lon = ac.get("lon").and_then(|v| v.as_f64());
+        let (lat, lon) = match (lat, lon) {
+            (Some(la), Some(lo)) => (la, lo),
+            _ => continue,
+        };
+
+        let trail = hist.entry(id).or_insert_with(|| Trail {
+            positions: VecDeque::new(),
+            last_pos: None,
+            last_seen: now,
+        });
+        trail.last_seen = now;
+        let new_pos = (lat, lon);
+        if let Some(prev) = trail.last_pos {
+            if prev != new_pos {
+                trail.positions.push_back(prev);
+                while trail.positions.len() > HISTORY_LEN {
+                    trail.positions.pop_front();
+                }
+            }
+        }
+        trail.last_pos = Some(new_pos);
+
+        let trail_arr: Vec<serde_json::Value> = trail
+            .positions
+            .iter()
+            .map(|&(la, lo)| serde_json::json!([la, lo]))
+            .collect();
+        if let Some(obj) = ac.as_object_mut() {
+            obj.insert("mc_history".to_string(), serde_json::Value::Array(trail_arr));
+        }
+    }
+
+    hist.retain(|_, t| now.duration_since(t.last_seen).as_secs() < HISTORY_STALE_S);
 }
 
 async fn ws_handler(

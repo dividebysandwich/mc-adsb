@@ -75,10 +75,9 @@
   let radiusCircle = null;
   let restrictedCircle = null;
   let restrictedCenter = null; // [lat, lon] — endpoint for alert lines
-  const markers = new Map(); // hex -> { marker, lastSeen, lastLat, lastLon, history: [], alert, alertLine }
+  const markers = new Map(); // hex -> { marker, lastSeen, history: [], alert, alertLine }
   const alertedIds = new Set();
   const STALE_MS = 15000;
-  const HISTORY_LEN = 10;
 
   function removeEntry(entry) {
     map.removeLayer(entry.marker);
@@ -114,18 +113,29 @@
     }
   }, 250);
 
-  function pushHistory(entry, lat, lon) {
-    const dot = L.circleMarker([lat, lon], {
-      radius: 2.5,
-      stroke: false,
-      fillColor: '#ffffff',
-      fillOpacity: 0.85,
-      interactive: false,
-      pane: 'overlayPane',
-    }).addTo(map);
-    entry.history.push(dot);
-    while (entry.history.length > HISTORY_LEN) {
-      map.removeLayer(entry.history.shift());
+  // Render trail dots from the server-supplied `mc_history` list. The history
+  // is fully replaced each update — markers are reused when the list length
+  // matches to avoid churn, otherwise the old set is torn down and rebuilt.
+  function setHistory(entry, points) {
+    if (!Array.isArray(points)) points = [];
+    if (points.length === entry.history.length) {
+      for (let i = 0; i < points.length; i++) {
+        entry.history[i].setLatLng(points[i]);
+      }
+      return;
+    }
+    for (const dot of entry.history) map.removeLayer(dot);
+    entry.history = [];
+    for (const p of points) {
+      const dot = L.circleMarker(p, {
+        radius: 2.5,
+        stroke: false,
+        fillColor: '#ffffff',
+        fillOpacity: 0.85,
+        interactive: false,
+        pane: 'overlayPane',
+      }).addTo(map);
+      entry.history.push(dot);
     }
   }
 
@@ -385,14 +395,9 @@
           .addTo(map)
           .bindTooltip(labelFor(ac), { permanent: true, direction: 'top', offset: [0, -16], className: 'adsb-label' })
           .bindPopup(popupFor(ac));
-        entry = { marker: marker, lastSeen: now, lastLat: ac.lat, lastLon: ac.lon, history: [], alert: !!ac.mc_alert };
+        entry = { marker: marker, lastSeen: now, history: [], alert: !!ac.mc_alert };
         markers.set(id, entry);
       } else {
-        if (entry.lastLat !== ac.lat || entry.lastLon !== ac.lon) {
-          pushHistory(entry, entry.lastLat, entry.lastLon);
-          entry.lastLat = ac.lat;
-          entry.lastLon = ac.lon;
-        }
         entry.marker.setLatLng(latlng);
         entry.marker.setIcon(icon);
         entry.marker.setTooltipContent(labelFor(ac));
@@ -400,6 +405,7 @@
         entry.lastSeen = now;
         entry.alert = !!ac.mc_alert;
       }
+      setHistory(entry, ac.mc_history);
       if (entry.alert) alertedIds.add(id);
       else alertedIds.delete(id);
 

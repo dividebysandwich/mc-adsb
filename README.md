@@ -69,6 +69,24 @@ The fields the frontend uses are:
 Records with missing `lat`/`lon` are still passed through; the frontend skips
 drawing them.
 
+### Trail history (`mc_history`)
+
+mc-adsb tracks each aircraft's recent positions on the server and attaches them
+as `mc_history` on every aircraft entry. The list contains up to the last 10
+**previous** positions, oldest first, as `[lat, lon]` pairs. The aircraft's
+current `lat`/`lon` is *not* duplicated in `mc_history`. Aircraft that go
+unseen for more than 30 seconds are dropped from the trail map, so reconnecting
+clients receive whatever trail the server has accumulated so far rather than
+starting from empty.
+
+```jsonc
+"mc_history": [
+  [48.2104, 16.3712],   // oldest
+  [48.2099, 16.3720],
+  [48.2090, 16.3729]    // most recent previous fix
+]
+```
+
 ### Alert annotation (`mc_alert`)
 
 mc-adsb adds **one extra field**, `mc_alert`, to every aircraft that is
