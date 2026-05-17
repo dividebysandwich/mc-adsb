@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
@@ -171,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/adsb", get(index))
         .route("/adsb/", get(index))
         .route("/adsb/ws", get(ws_handler))
+        .route("/adsb/snapshot", get(snapshot))
         .route("/adsb/simulate", get(simulate))
         .route("/adsb/healthz", get(|| async { "ok" }))
         .with_state(state)
@@ -278,6 +280,22 @@ async fn fetch(client: &reqwest::Client, url: &str) -> anyhow::Result<AdsbRespon
 
 async fn index() -> impl IntoResponse {
     Html(include_str!("../web/index.html"))
+}
+
+async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
+    match state.latest.read().await.clone() {
+        Some(json) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json,
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no snapshot available yet",
+        )
+            .into_response(),
+    }
 }
 
 async fn simulate(State(state): State<AppState>) -> impl IntoResponse {

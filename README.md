@@ -107,6 +107,17 @@ The prediction is a straight-line extrapolation of the current `lat`/`lon`
 along `track` at `gs`. Aircraft without a valid `gs`/`track` are not alerted
 unless they are already inside the cylinder.
 
+## HTTP snapshot
+
+```
+curl http://<host>:3008/adsb/snapshot
+```
+
+Returns the most recent snapshot — the same JSON payload that is pushed over
+the WebSocket — for clients that cannot use WebSockets. Polls should be paced
+to `--poll-interval`; faster polling will only return the same cached snapshot.
+Returns `503 Service Unavailable` until the first upstream poll has completed.
+
 ## Simulating an intrusion
 
 ```
