@@ -693,6 +693,8 @@
       const [aspRows, aptRows] = await Promise.all([aspResp.json(), aptResp.json()]);
 
       map.addSource('airspaces', { type: 'geojson', data: buildAirspaceGeoJSON(aspRows) });
+      // 3D extruded boxes for tilted views, flat polygons for the top-down
+      // orthographic view. Visibility is toggled in syncAirspaceMode below.
       map.addLayer({
         id: 'airspaces-fill', type: 'fill-extrusion', source: 'airspaces',
         paint: {
@@ -703,9 +705,19 @@
         },
       });
       map.addLayer({
+        id: 'airspaces-fill-flat', type: 'fill', source: 'airspaces',
+        layout: { 'visibility': 'none' },
+        paint: {
+          'fill-color': ['get', 'color'],
+          'fill-opacity': 0.12,
+        },
+      });
+      map.addLayer({
         id: 'airspaces-outline', type: 'line', source: 'airspaces',
         paint: { 'line-color': ['get', 'color'], 'line-width': 1.2, 'line-opacity': 0.7 },
       });
+      syncAirspaceMode();
+      map.on('pitch', syncAirspaceMode);
 
       map.addSource('airports', { type: 'geojson', data: buildAirportGeoJSON(aptRows) });
       map.addLayer({
@@ -730,7 +742,7 @@
         },
       });
 
-      map.on('click', 'airspaces-fill', (e) => {
+      const airspaceClick = (e) => {
         const f = e.features && e.features[0]; if (!f) return;
         const p = f.properties;
         new maplibregl.Popup({ closeButton: true }).setLngLat(e.lngLat).setHTML(
@@ -739,9 +751,14 @@
           '<div>Lower: ' + escapeHtml(p.lowerLabel || '0') + '</div>' +
           '<div>Upper: ' + escapeHtml(p.upperLabel || '') + '</div>'
         ).addTo(map);
-      });
-      map.on('mouseenter', 'airspaces-fill', () => { map.getCanvas().style.cursor = 'pointer'; });
-      map.on('mouseleave', 'airspaces-fill', () => { map.getCanvas().style.cursor = ''; });
+      };
+      const setPointer = () => { map.getCanvas().style.cursor = 'pointer'; };
+      const clearPointer = () => { map.getCanvas().style.cursor = ''; };
+      for (const id of ['airspaces-fill', 'airspaces-fill-flat']) {
+        map.on('click', id, airspaceClick);
+        map.on('mouseenter', id, setPointer);
+        map.on('mouseleave', id, clearPointer);
+      }
       map.on('click', 'airports-dot', (e) => {
         const f = e.features && e.features[0]; if (!f) return;
         const p = f.properties;
@@ -766,6 +783,14 @@
   });
 
   function emptyFC() { return { type: 'FeatureCollection', features: [] }; }
+
+  // Flat fill at pitch≈0 (orthographic top-down), 3D extrusion otherwise.
+  function syncAirspaceMode() {
+    if (!map.getLayer('airspaces-fill') || !map.getLayer('airspaces-fill-flat')) return;
+    const ortho = map.getPitch() < ORTHO_PITCH_EPS;
+    map.setLayoutProperty('airspaces-fill',      'visibility', ortho ? 'none'    : 'visible');
+    map.setLayoutProperty('airspaces-fill-flat', 'visibility', ortho ? 'visible' : 'none');
+  }
 
   // ---------------------------------------------------------------------------
   // Snapshot application
