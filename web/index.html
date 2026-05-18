@@ -4,16 +4,32 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>mc-adsb live traffic</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-      crossorigin="" />
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-        crossorigin=""></script>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, sans-serif; }
   #adsb-root { position: relative; width: 100%; height: 100%; }
   #adsb-map { width: 100%; height: 100%; background: #0b1320; }
+
+  /* Floating labels for 3D aircraft. Positioned in screen pixels each frame. */
+  #adsb-labels {
+    position: absolute; inset: 0; pointer-events: none; z-index: 5;
+    overflow: hidden;
+  }
+  .adsb-label {
+    position: absolute; left: 0; top: 0;
+    background: rgba(15,23,42,.85); color: #f1f5f9;
+    padding: 2px 5px; border-radius: 3px; font-size: 11px;
+    white-space: nowrap; pointer-events: auto; cursor: pointer;
+    will-change: transform; user-select: none;
+    transform-origin: 50% 100%;
+  }
+  .adsb-label.alert-on {
+    background: #dc2626; color: #ffffff;
+  }
+  .adsb-label.hidden { display: none; }
+
   .adsb-status {
     position: absolute; top: 10px; right: 10px; z-index: 1000;
     background: rgba(15,23,42,.85); color: #e2e8f0;
@@ -23,192 +39,252 @@
   .adsb-status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     background: #f87171; margin-right: 6px; vertical-align: middle; }
   .adsb-status.connected .dot { background: #4ade80; }
-  .adsb-plane {
-    width: 32px; height: 32px;
+
+  .adsb-hint {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 1000;
+    background: rgba(15,23,42,.7); color: #cbd5e1;
+    padding: 4px 8px; border-radius: 4px; font-size: 11px;
+    pointer-events: none;
+  }
+
+  /* Custom bottom-right control: shows current pitch + bearing, click to reset. */
+  .mc-reset-btn {
+    width: 36px; height: 36px;
+    background: transparent;
+    border: none; cursor: pointer; padding: 4px;
     display: flex; align-items: center; justify-content: center;
-    pointer-events: auto;
+  }
+  .mc-reset-icon {
+    width: 28px; height: 28px;
+    display: block;
     transform-origin: 50% 50%;
+    transition: transform 120ms linear;
+    will-change: transform;
   }
-  .adsb-plane svg { width: 32px; height: 32px; display: block;
-    filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
-  .adsb-label {
-    background: rgba(15,23,42,.85); color: #f1f5f9;
-    padding: 2px 5px; border-radius: 3px; font-size: 11px;
-    border: none; box-shadow: none; white-space: nowrap;
+  .mc-reset-icon svg { width: 100%; height: 100%; display: block; }
+
+  .maplibregl-popup-content {
+    font-family: system-ui; font-size: 12px;
+    background: rgba(15,23,42,0.95); color: #f1f5f9;
+    border-radius: 6px;
   }
-  .leaflet-tooltip-top.adsb-label::before { display: none; }
-  /* Alerted aircraft: flash white-on-red 2 Hz (toggled by JS every 250 ms). */
-  .adsb-label.alert-on {
-    background: #dc2626 !important;
-    color: #ffffff !important;
-  }
+  .maplibregl-popup-tip { border-top-color: rgba(15,23,42,0.95) !important; }
+  .maplibregl-popup-close-button { color: #f1f5f9; font-size: 16px; }
+  .maplibregl-ctrl-attrib { font-size: 10px; }
 </style>
 </head>
 <body>
 <div id="adsb-root">
   <div id="adsb-map"></div>
+  <div id="adsb-labels"></div>
   <div id="adsb-status" class="adsb-status"><span class="dot"></span><span id="adsb-status-text">connecting…</span></div>
+  <div class="adsb-hint">Right-click drag: pitch &amp; rotate · Scroll: zoom · Click the compass to reset</div>
 </div>
 <script>
 (function () {
-  const root = document.getElementById('adsb-root');
   const statusEl = document.getElementById('adsb-status');
   const statusText = document.getElementById('adsb-status-text');
+  const labelsRoot = document.getElementById('adsb-labels');
 
-  const scriptOrigin = window.location.origin;
   const basePath = '/adsb';
   const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const wsUrl = wsProto + '://' + window.location.host + basePath + '/ws';
 
-  const map = L.map('adsb-map', {
-    zoomControl: true,
-    worldCopyJump: true,
-  }).setView([48.2082, 16.3738], 8);
+  // Pitch threshold below which we switch to orthographic projection.
+  // Strict 0° produces a hard switch; a tiny epsilon avoids float jitter.
+  const ORTHO_PITCH_EPS = 0.5;
 
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; OpenStreetMap &copy; CARTO &middot; data &copy; adsb.lol',
-    subdomains: 'abcd',
-    maxZoom: 19,
-  }).addTo(map);
+  // ---------------------------------------------------------------------------
+  // Map setup
+  // ---------------------------------------------------------------------------
+  const style = {
+    version: 8,
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    sources: {
+      'carto-dark': {
+        type: 'raster',
+        tiles: [
+          'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+          'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+          'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+          'https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+        ],
+        tileSize: 256,
+        attribution: '&copy; OpenStreetMap &copy; CARTO &middot; data &copy; adsb.lol &middot; airspace/airport &copy; OpenAIP',
+        maxzoom: 19,
+      },
+    },
+    layers: [
+      { id: 'background', type: 'background', paint: { 'background-color': '#0b1320' } },
+      { id: 'carto', type: 'raster', source: 'carto-dark' },
+    ],
+  };
 
-  let centerMarker = null;
-  let radiusCircle = null;
-  let restrictedCircle = null;
-  let restrictedCenter = null; // [lat, lon] — endpoint for alert lines
-  const markers = new Map(); // hex -> { marker, lastSeen, history: [], alert, alertLine }
-  const alertedIds = new Set();
-  const STALE_MS = 15000;
+  const map = new maplibregl.Map({
+    container: 'adsb-map',
+    style: style,
+    center: [16.3738, 48.2082],
+    zoom: 9,
+    pitch: 0,
+    bearing: 0,
+    maxPitch: 85,
+    antialias: true,
+    // dragRotate is enabled by default and binds right-mouse-button drag to
+    // pitch + bearing — exactly what we want, so no explicit configuration
+    // beyond making sure it stays on.
+    dragRotate: true,
+    pitchWithRotate: true,
+  });
+  map.addControl(new maplibregl.NavigationControl({
+    showCompass: false, showZoom: true, visualizePitch: false,
+  }), 'top-left');
+  map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: 'metric' }), 'bottom-left');
 
-  function removeEntry(entry) {
-    map.removeLayer(entry.marker);
-    for (const dot of entry.history) map.removeLayer(dot);
-    if (entry.alertLine) { map.removeLayer(entry.alertLine); entry.alertLine = null; }
-  }
-
-  function pruneStale() {
-    const now = Date.now();
-    for (const [id, entry] of markers) {
-      if (now - entry.lastSeen > STALE_MS) {
-        removeEntry(entry);
-        markers.delete(id);
-        alertedIds.delete(id);
-      }
+  // Custom bottom-right control: a tiny compass that mirrors the camera's
+  // pitch + bearing in real time, and resets both to 0 on click. The
+  // perspective transform tilts the SVG forward as pitch increases.
+  class ResetCompassControl {
+    onAdd(m) {
+      this._map = m;
+      const container = document.createElement('div');
+      container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'mc-reset-btn';
+      button.title = 'Reset pitch & rotation';
+      button.setAttribute('aria-label', 'Reset pitch and rotation');
+      const icon = document.createElement('span');
+      icon.className = 'mc-reset-icon';
+      // North half red, south half white; outer ring for legibility.
+      icon.innerHTML =
+        '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">' +
+          '<circle cx="12" cy="12" r="10.5" fill="rgba(15,23,42,0.7)" stroke="#475569" stroke-width="0.8"/>' +
+          '<polygon points="12,3 16,12 12,11 8,12" fill="#ef4444" stroke="#1e293b" stroke-width="0.5"/>' +
+          '<polygon points="12,21 16,12 12,13 8,12" fill="#f1f5f9" stroke="#1e293b" stroke-width="0.5"/>' +
+          '<text x="12" y="6.3" text-anchor="middle" font-size="3.2" fill="#fecaca" font-family="system-ui" font-weight="700">N</text>' +
+        '</svg>';
+      button.appendChild(icon);
+      button.addEventListener('click', () => {
+        m.easeTo({ pitch: 0, bearing: 0, duration: 450 });
+      });
+      container.appendChild(button);
+      this._container = container;
+      this._icon = icon;
+      this._update = () => {
+        const pitch = m.getPitch();
+        const bearing = m.getBearing();
+        icon.style.transform =
+          'perspective(80px) rotateX(' + pitch + 'deg) rotateZ(' + (-bearing) + 'deg)';
+      };
+      m.on('pitch', this._update);
+      m.on('rotate', this._update);
+      this._update();
+      return container;
+    }
+    onRemove() {
+      this._map.off('pitch', this._update);
+      this._map.off('rotate', this._update);
+      this._container.parentNode.removeChild(this._container);
     }
   }
-  setInterval(pruneStale, 1000);
+  map.addControl(new ResetCompassControl(), 'bottom-right');
 
-  // 2 Hz flash: toggle the `alert-on` class on every alerted aircraft's label
-  // every 250 ms (one on/off cycle every 500 ms = 2 Hz).
-  let alertFlashOn = false;
-  setInterval(function () {
-    alertFlashOn = !alertFlashOn;
-    for (const id of alertedIds) {
-      const entry = markers.get(id);
-      if (!entry) continue;
-      const tip = entry.marker.getTooltip && entry.marker.getTooltip();
-      const el = tip && tip.getElement && tip.getElement();
-      if (!el) continue;
-      if (alertFlashOn) el.classList.add('alert-on');
-      else el.classList.remove('alert-on');
-    }
-  }, 250);
-
-  // Render trail dots from the server-supplied `mc_history` list. The history
-  // is fully replaced each update — markers are reused when the list length
-  // matches to avoid churn, otherwise the old set is torn down and rebuilt.
-  function setHistory(entry, points) {
-    if (!Array.isArray(points)) points = [];
-    if (points.length === entry.history.length) {
-      for (let i = 0; i < points.length; i++) {
-        entry.history[i].setLatLng(points[i]);
-      }
-      return;
-    }
-    for (const dot of entry.history) map.removeLayer(dot);
-    entry.history = [];
-    for (const p of points) {
-      const dot = L.circleMarker(p, {
-        radius: 2.5,
-        stroke: false,
-        fillColor: '#ffffff',
-        fillOpacity: 0.85,
-        interactive: false,
-        pane: 'overlayPane',
-      }).addTo(map);
-      entry.history.push(dot);
+  // ---------------------------------------------------------------------------
+  // Airspaces + airports
+  // ---------------------------------------------------------------------------
+  const FT_TO_M = 0.3048;
+  function vertToMeters(v) {
+    if (!v || typeof v.value !== 'number') return 0;
+    switch (v.unit) {
+      case 1: return v.value * FT_TO_M;
+      case 6: return v.value * 100 * FT_TO_M;
+      case 0: return v.value;
+      default: return v.value * FT_TO_M;
     }
   }
-
-  // Heli ICAO type designators — used when an aircraft doesn't transmit category A7.
-  const HELI_TYPES = new Set(['EC20','EC25','EC30','EC35','EC45','EC55','EC75','EC20T','EC30T',
-    'AS32','AS35','AS50','AS55','AS65','AS3B','A109','A119','A139','A149','A169','A189',
-    'B06','B06T','B105','B212','B214','B222','B230','B407','B412','B427','B429','B430','B47G',
-    'B505','B47J','BK17','EH10','H160','H175','H47','H500','H60','H64',
-    'R22','R44','R66','S330','S55T','S58T','S61','S64','S76','S92','UH1',
-    'PUMA','LYNX','TIGR','EXPL','GAZL','HUCO','NH90','SYCA','WASP','WESX','WG30','S70',
-    'MI2','MI8','MI17','MI24','MI26','MI28','MI34','KA26','KA32','KA50','KA52','KA62',
-    'A129','EH101','LAMA','ALO2','ALO3','DJIN','BSTP','EXEC','ENST','HUSK','SCHW']);
-
-  // Common glider/sailplane ICAO type designators (DG, ASK, Discus, Duo Discus, Janus, Nimbus,
-  // Ventus, LS-series, ASW, ASH, Schweizer trainers, motor-gliders, etc.).
-  const GLIDER_TYPES = new Set(['AS21','AS22','AS24','AS25','AS28','AS29','AS33',
-    'ASK13','ASK14','ASK18','ASK21','AS21','DG1T','DG40','DG50','DG80','DG10','DG30','DG60',
-    'DISC','DUOD','JANS','NIMB','VENT','LS3','LS4','LS6','LS7','LS8','LS9','LS10','ASW','ASH',
-    'STD','STDC','SF25','SF34','SF36','SZD','PUC','PER','PHO','TWIN','ARCU','BLNK','PIPR',
-    'PIK20','PIK30','PW5','PW6','SZ4','SZD9','G103','G102','G104','SZD55','SZD51']);
-
-  function craftKind(ac) {
-    if (!ac) return 'plane';
-    const cat = typeof ac.category === 'string' ? ac.category.toUpperCase() : '';
-    const t = typeof ac.t === 'string' ? ac.t.toUpperCase() : '';
-
-    // Towers/obstacles report as type "TWR" with no category, or as C3/C4/C5.
-    if (t === 'TWR' || cat === 'C3' || cat === 'C4' || cat === 'C5') return 'tower';
-    // Surface vehicles: emergency or service.
-    if (cat === 'C1' || cat === 'C2') return 'vehicle';
-    // Rotorcraft.
-    if (cat === 'A7' || HELI_TYPES.has(t)) return 'heli';
-    // Glider / sailplane.
-    if (cat === 'B1' || GLIDER_TYPES.has(t)) return 'glider';
-    // Drone / UAV.
-    if (cat === 'B6') return 'drone';
-    // Light aircraft (single-engine props, trainers).
-    if (cat === 'A1' || cat === 'A2') return 'light';
-    return 'plane';
+  function airspaceColor(type, icaoClass) {
+    if (type === 1 || type === 3) return '#dc2626';
+    if (type === 2)               return '#f97316';
+    if (type === 14 || type === 4) return '#fbbf24';
+    if (type === 7 || type === 21) return '#38bdf8';
+    if (type === 5)               return '#a855f7';
+    if (type === 6)               return '#22c55e';
+    if (type === 25)              return '#facc15';
+    if (icaoClass === 8)          return '#dc2626';
+    return '#94a3b8';
+  }
+  function buildAirspaceGeoJSON(rows) {
+    const features = [];
+    for (const a of rows) {
+      const g = a.geometry;
+      if (!g || g.type !== 'Polygon') continue;
+      const base = vertToMeters(a.lowerLimit);
+      const top  = vertToMeters(a.upperLimit);
+      features.push({
+        type: 'Feature', geometry: g,
+        properties: {
+          name: a.name || '',
+          type: a.type, icaoClass: a.icaoClass,
+          base: base, height: Math.max(top, base + 1),
+          color: airspaceColor(a.type, a.icaoClass),
+          upperLabel: a.upperLimit ? (a.upperLimit.value + (a.upperLimit.unit === 6 ? ' FL' : (a.upperLimit.unit === 1 ? ' ft' : ''))) : '',
+          lowerLabel: a.lowerLimit ? (a.lowerLimit.value + (a.lowerLimit.unit === 6 ? ' FL' : (a.lowerLimit.unit === 1 ? ' ft' : ''))) : '',
+        },
+      });
+    }
+    return { type: 'FeatureCollection', features };
+  }
+  const APT_TYPE = {
+    0: 'Airport', 1: 'Intl', 2: 'Airfield', 3: 'Helipad', 4: 'Glider',
+    5: 'Military', 6: 'Ultralight', 7: 'Heliport', 8: 'Closed', 9: 'Water',
+  };
+  function buildAirportGeoJSON(rows) {
+    const features = [];
+    for (const a of rows) {
+      const g = a.geometry;
+      if (!g || g.type !== 'Point') continue;
+      features.push({
+        type: 'Feature', geometry: g,
+        properties: {
+          name: a.name || '', icao: a.icaoCode || '',
+          type: a.type, typeLabel: APT_TYPE[a.type] || ('type ' + a.type),
+          elevation: a.elevation ? a.elevation.value : null,
+        },
+      });
+    }
+    return { type: 'FeatureCollection', features };
   }
 
-  // All SVGs are 32x32 and drawn nose-up so CSS rotation maps directly to track.
-  const SVG_OPEN = '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">';
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Aircraft icon SVGs (reused from the 2D version, rasterized to textures)
+  // ---------------------------------------------------------------------------
+  const SVG_OPEN = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="64" height="64">';
   const SVG_CLOSE = '</svg>';
   const STROKE = 'stroke="#1e293b" stroke-width="1" stroke-linejoin="round"';
-
-  // Airliner: swept wings, long fuselage.
   const PLANE_SVG = SVG_OPEN +
     '<path d="M16 1.5 C 17.2 1.5 17.9 3 17.9 5.2 L 17.9 11.5 L 30 18.2 L 30 20.4 ' +
             'L 17.9 17.2 L 17.9 24.6 L 22 27.2 L 22 28.6 L 16 27.3 L 10 28.6 L 10 27.2 ' +
             'L 14.1 24.6 L 14.1 17.2 L 2 20.4 L 2 18.2 L 14.1 11.5 L 14.1 5.2 ' +
             'C 14.1 3 14.8 1.5 16 1.5 Z" fill="#fbbf24" ' + STROKE + '/>' + SVG_CLOSE;
-
-  // Light aircraft: straighter wings, smaller, a touch greener so it stands out from airliners.
   const LIGHT_SVG = SVG_OPEN +
     '<path d="M16 4 C 16.9 4 17.4 5 17.4 6.5 L 17.4 12.5 L 27 14 L 27 16 L 17.4 15.5 ' +
             'L 17.4 23.5 L 20.5 26 L 20.5 27 L 16 26.2 L 11.5 27 L 11.5 26 L 14.6 23.5 ' +
             'L 14.6 15.5 L 5 16 L 5 14 L 14.6 12.5 L 14.6 6.5 C 14.6 5 15.1 4 16 4 Z" ' +
             'fill="#86efac" ' + STROKE + '/>' + SVG_CLOSE;
-
-  // Glider: long thin straight wings, very thin fuselage, T-tail.
   const GLIDER_SVG = SVG_OPEN +
-    // wings (very wide, very thin)
     '<rect x="1" y="14.2" width="30" height="2.2" rx="1" fill="#f1f5f9" ' + STROKE + '/>' +
-    // fuselage (thin)
     '<path d="M16 2 C 16.7 2 17.1 3 17.1 4.5 L 17.1 26 L 18.6 27.5 L 18.6 28.5 ' +
             'L 13.4 28.5 L 13.4 27.5 L 14.9 26 L 14.9 4.5 C 14.9 3 15.3 2 16 2 Z" ' +
             'fill="#f1f5f9" ' + STROKE + '/>' +
-    // horizontal stabilizer (T-tail)
     '<rect x="9.5" y="25.2" width="13" height="1.6" rx="0.6" fill="#f1f5f9" ' + STROKE + '/>' +
     SVG_CLOSE;
-
-  // Helicopter: rotor disc + crossed blades + small fuselage.
   const HELI_SVG = SVG_OPEN +
     '<circle cx="16" cy="14" r="13" fill="#38bdf8" fill-opacity="0.18" ' +
             'stroke="#38bdf8" stroke-opacity="0.6" stroke-width="0.8"/>' +
@@ -219,29 +295,19 @@
             'C 12.8 17.4 11.4 15.5 11.4 13 C 11.4 10.5 12.8 8 16 8 Z" ' +
             'fill="#fbbf24" ' + STROKE + '/>' +
     SVG_CLOSE;
-
-  // Drone / UAV: small quadcopter — 4 rotor circles around a square body.
   const DRONE_SVG = SVG_OPEN +
-    // arms (X)
     '<line x1="7" y1="7" x2="25" y2="25" stroke="#22d3ee" stroke-width="2" stroke-linecap="round"/>' +
     '<line x1="25" y1="7" x2="7" y2="25" stroke="#22d3ee" stroke-width="2" stroke-linecap="round"/>' +
-    // rotors
     '<circle cx="7" cy="7" r="4" fill="#22d3ee" fill-opacity="0.25" stroke="#22d3ee" stroke-width="1"/>' +
     '<circle cx="25" cy="7" r="4" fill="#22d3ee" fill-opacity="0.25" stroke="#22d3ee" stroke-width="1"/>' +
     '<circle cx="7" cy="25" r="4" fill="#22d3ee" fill-opacity="0.25" stroke="#22d3ee" stroke-width="1"/>' +
     '<circle cx="25" cy="25" r="4" fill="#22d3ee" fill-opacity="0.25" stroke="#22d3ee" stroke-width="1"/>' +
-    // body
     '<rect x="12" y="12" width="8" height="8" rx="1.5" fill="#0e7490" ' + STROKE + '/>' +
     SVG_CLOSE;
-
-  // Ground vehicle: rounded rectangle, viewed from above.
   const VEHICLE_SVG = SVG_OPEN +
     '<rect x="10" y="6" width="12" height="20" rx="3" fill="#94a3b8" ' + STROKE + '/>' +
-    // windshield hint
     '<rect x="11.5" y="8" width="9" height="4" rx="1" fill="#1e293b" fill-opacity="0.4"/>' +
     SVG_CLOSE;
-
-  // Tower / fixed obstacle: warning triangle.
   const TOWER_SVG = SVG_OPEN +
     '<path d="M16 4 L 28 26 L 4 26 Z" fill="#ef4444" ' + STROKE + '/>' +
     '<rect x="15.2" y="11" width="1.6" height="9" fill="#0f172a"/>' +
@@ -249,28 +315,60 @@
     SVG_CLOSE;
 
   const ICON_DEFS = {
-    plane:   { svg: PLANE_SVG,   rotate: true,  cls: 'adsb-plane-icon' },
-    light:   { svg: LIGHT_SVG,   rotate: true,  cls: 'adsb-light-icon' },
-    glider:  { svg: GLIDER_SVG,  rotate: true,  cls: 'adsb-glider-icon' },
-    heli:    { svg: HELI_SVG,    rotate: true,  cls: 'adsb-heli-icon' },
-    drone:   { svg: DRONE_SVG,   rotate: false, cls: 'adsb-drone-icon' },
-    vehicle: { svg: VEHICLE_SVG, rotate: true,  cls: 'adsb-vehicle-icon' },
-    tower:   { svg: TOWER_SVG,   rotate: false, cls: 'adsb-tower-icon' },
+    plane:   { svg: PLANE_SVG,   rotate: true  },
+    light:   { svg: LIGHT_SVG,   rotate: true  },
+    glider:  { svg: GLIDER_SVG,  rotate: true  },
+    heli:    { svg: HELI_SVG,    rotate: true  },
+    drone:   { svg: DRONE_SVG,   rotate: false },
+    vehicle: { svg: VEHICLE_SVG, rotate: true  },
+    tower:   { svg: TOWER_SVG,   rotate: false },
   };
+  const ICON_TEXTURES = {};   // populated asynchronously
+  const ICON_MATERIALS = {};  // PlaneGeometry materials keyed by kind
 
-  function craftIcon(ac) {
-    const def = ICON_DEFS[craftKind(ac)] || ICON_DEFS.plane;
-    const rotation = (def.rotate && typeof ac.track === 'number') ? ac.track : 0;
-    const html =
-      '<div class="adsb-plane" style="transform: rotate(' + rotation + 'deg);">' +
-        def.svg +
-      '</div>';
-    return L.divIcon({
-      className: def.cls,
-      html: html,
-      iconSize: [32, 32],
-      iconAnchor: [16, 16],
+  function svgToImage(svg) {
+    return new Promise((resolve) => {
+      const blob = new Blob([svg], { type: 'image/svg+xml' });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+      img.src = url;
     });
+  }
+
+  const HELI_TYPES = new Set(['EC20','EC25','EC30','EC35','EC45','EC55','EC75','EC20T','EC30T',
+    'AS32','AS35','AS50','AS55','AS65','AS3B','A109','A119','A139','A149','A169','A189',
+    'B06','B06T','B105','B212','B214','B222','B230','B407','B412','B427','B429','B430','B47G',
+    'B505','B47J','BK17','EH10','H160','H175','H47','H500','H60','H64',
+    'R22','R44','R66','S330','S55T','S58T','S61','S64','S76','S92','UH1',
+    'PUMA','LYNX','TIGR','EXPL','GAZL','HUCO','NH90','SYCA','WASP','WESX','WG30','S70',
+    'MI2','MI8','MI17','MI24','MI26','MI28','MI34','KA26','KA32','KA50','KA52','KA62',
+    'A129','EH101','LAMA','ALO2','ALO3','DJIN','BSTP','EXEC','ENST','HUSK','SCHW']);
+  const GLIDER_TYPES = new Set(['AS21','AS22','AS24','AS25','AS28','AS29','AS33',
+    'ASK13','ASK14','ASK18','ASK21','AS21','DG1T','DG40','DG50','DG80','DG10','DG30','DG60',
+    'DISC','DUOD','JANS','NIMB','VENT','LS3','LS4','LS6','LS7','LS8','LS9','LS10','ASW','ASH',
+    'STD','STDC','SF25','SF34','SF36','SZD','PUC','PER','PHO','TWIN','ARCU','BLNK','PIPR',
+    'PIK20','PIK30','PW5','PW6','SZ4','SZD9','G103','G102','G104','SZD55','SZD51']);
+
+  function craftKind(ac) {
+    if (!ac) return 'plane';
+    const cat = typeof ac.category === 'string' ? ac.category.toUpperCase() : '';
+    const t = typeof ac.t === 'string' ? ac.t.toUpperCase() : '';
+    if (t === 'TWR' || cat === 'C3' || cat === 'C4' || cat === 'C5') return 'tower';
+    if (cat === 'C1' || cat === 'C2') return 'vehicle';
+    if (cat === 'A7' || HELI_TYPES.has(t)) return 'heli';
+    if (cat === 'B1' || GLIDER_TYPES.has(t)) return 'glider';
+    if (cat === 'B6') return 'drone';
+    if (cat === 'A1' || cat === 'A2') return 'light';
+    return 'plane';
+  }
+
+  function aircraftAltMeters(ac) {
+    if (ac.alt_baro === 'ground') return 0;
+    if (typeof ac.alt_baro === 'number') return ac.alt_baro * FT_TO_M;
+    if (typeof ac.alt_geom === 'number') return ac.alt_geom * FT_TO_M;
+    return 0;
   }
 
   function labelFor(ac) {
@@ -282,32 +380,543 @@
     const parts = [cs, alt, gs].filter(Boolean);
     if (ac.mc_alert) {
       const a = ac.mc_alert;
-      if (a.inside) {
-        parts.push('INSIDE ' + Math.round(a.min_distance_m) + 'm');
-      } else {
-        parts.push('ETA ' + a.eta_s.toFixed(1) + 's @ ' + Math.round(a.min_distance_m) + 'm');
-      }
+      if (a.inside) parts.push('INSIDE ' + Math.round(a.min_distance_m) + 'm');
+      else          parts.push('ETA ' + a.eta_s.toFixed(1) + 's @ ' + Math.round(a.min_distance_m) + 'm');
     }
     return parts.join(' · ');
   }
 
-  function popupFor(ac) {
+  function popupHtml(ac) {
     const rows = [
       ['Flight', ac.flight && ac.flight.trim()],
-      ['Reg', ac.r],
-      ['Type', ac.t],
-      ['Hex', ac.hex],
-      ['Alt (baro)', ac.alt_baro],
-      ['Alt (geom)', ac.alt_geom],
+      ['Reg', ac.r], ['Type', ac.t], ['Hex', ac.hex],
+      ['Alt (baro)', ac.alt_baro], ['Alt (geom)', ac.alt_geom],
       ['Speed', (typeof ac.gs === 'number') ? ac.gs.toFixed(0) + ' kt' : null],
       ['Track', (typeof ac.track === 'number') ? ac.track.toFixed(0) + '°' : null],
       ['V/S', (typeof ac.baro_rate === 'number') ? ac.baro_rate + ' fpm' : null],
-      ['Squawk', ac.squawk],
-      ['Category', ac.category],
+      ['Squawk', ac.squawk], ['Category', ac.category],
     ].filter(r => r[1] !== undefined && r[1] !== null && r[1] !== '');
     return '<div style="font-family:system-ui;font-size:12px;min-width:160px">'
-      + rows.map(r => '<div><b>' + r[0] + ':</b> ' + r[1] + '</div>').join('')
+      + rows.map(r => '<div><b>' + r[0] + ':</b> ' + escapeHtml(r[1]) + '</div>').join('')
       + '</div>';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Three.js custom layer — 3D aircraft + trails + alert lines
+  // ---------------------------------------------------------------------------
+  // Per-aircraft state. Maps id -> {
+  //   group: THREE.Group at mercator position,
+  //   mesh: textured plane,
+  //   kind: string,
+  //   trail: THREE.Line,
+  //   alertLine: THREE.Line | null,
+  //   labelEl: HTMLElement,
+  //   popup: maplibregl.Popup,
+  //   ac: latest aircraft snapshot,
+  //   alert: boolean,
+  //   lastSeen: ms,
+  //   lngLat: [lng, lat],
+  //   altMeters: number,
+  // }
+  const aircraftEntries = new Map();
+  const alertedIds = new Set();
+  let restrictedCenter = null; // [lat, lon]
+  let pendingSnapshot = null;
+  let layerReady = false;
+  let centerFramed = false;
+
+  const STALE_MS = 15000;
+
+  // The custom layer instance.
+  const aircraftLayer = {
+    id: 'aircraft-3d',
+    type: 'custom',
+    renderingMode: '3d',
+
+    onAdd(_map, gl) {
+      this.scene = new THREE.Scene();
+      this.camera = new THREE.Camera();
+      this.renderer = new THREE.WebGLRenderer({
+        canvas: _map.getCanvas(),
+        context: gl,
+        antialias: true,
+      });
+      this.renderer.autoClear = false;
+
+      // Bucket groups so we can recolor/swap easily later if needed.
+      this.aircraftGroup = new THREE.Group();
+      this.trailGroup = new THREE.Group();
+      this.alertGroup = new THREE.Group();
+      this.scene.add(this.aircraftGroup);
+      this.scene.add(this.trailGroup);
+      this.scene.add(this.alertGroup);
+
+      // Preload aircraft icon textures.
+      const promises = Object.keys(ICON_DEFS).map(async (kind) => {
+        const img = await svgToImage(ICON_DEFS[kind].svg);
+        if (!img) return;
+        const tex = new THREE.Texture(img);
+        tex.needsUpdate = true;
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        // flipY:false places the SVG's "top" (nose) at the mesh's -Y, which
+        // is mercator-north — so an aircraft with track=0 actually points
+        // north before the per-aircraft Z-rotation is applied.
+        tex.flipY = false;
+        ICON_TEXTURES[kind] = tex;
+        ICON_MATERIALS[kind] = new THREE.MeshBasicMaterial({
+          map: tex, transparent: true, side: THREE.DoubleSide,
+          depthTest: false, depthWrite: false,
+        });
+      });
+      Promise.all(promises).then(() => {
+        layerReady = true;
+        if (pendingSnapshot) {
+          const s = pendingSnapshot; pendingSnapshot = null;
+          applySnapshot(s);
+        }
+        map.triggerRepaint();
+      });
+    },
+
+    render(gl, args) {
+      // MapLibre 4 passes the projection matrix as the second argument
+      // (array of 16 numbers). MapLibre 5 passes an args object — handle both.
+      const matrix = Array.isArray(args) ? args : (args && args.defaultProjectionData && args.defaultProjectionData.mainMatrix) || args;
+
+      const pitch = map.getPitch();
+      if (pitch < ORTHO_PITCH_EPS) {
+        this.camera.projectionMatrix = buildOrthoMatrix();
+      } else {
+        const m = new THREE.Matrix4().fromArray(matrix);
+        this.camera.projectionMatrix = m;
+      }
+      this.camera.projectionMatrixInverse = new THREE.Matrix4().copy(this.camera.projectionMatrix).invert();
+
+      // Scale aircraft meshes to roughly 32 px on screen, independent of zoom.
+      // metersPerPixel at map center is a reasonable global approximation.
+      const mpp = metersPerPixel();
+      const pixelSize = 36;
+      const meterScale = mpp * pixelSize;
+      for (const entry of aircraftEntries.values()) {
+        if (!entry.mesh) continue;
+        const merc = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
+        const mpm = merc.meterInMercatorCoordinateUnits();
+        entry.group.position.set(merc.x, merc.y, merc.z);
+        const s = meterScale * mpm;
+        entry.mesh.scale.set(s, s, s);
+      }
+
+      this.renderer.resetState();
+      this.renderer.render(this.scene, this.camera);
+
+      // Keep DOM labels glued to projected aircraft positions.
+      updateLabels(this.camera.projectionMatrix);
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Projection helpers
+  // ---------------------------------------------------------------------------
+  function metersPerPixel() {
+    const lat = map.getCenter().lat;
+    return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, map.getZoom());
+  }
+
+  // Orthographic projection matrix matching the map's current centre / zoom
+  // / bearing. Z is squashed away — every altitude renders at its true lat/lon.
+  function buildOrthoMatrix() {
+    const center = map.getCenter();
+    const centerMerc = maplibregl.MercatorCoordinate.fromLngLat(center, 0);
+    const zoom = map.getZoom();
+    const pxPerMerc = Math.pow(2, zoom) * 512;
+    const canvas = map.getCanvas();
+    const w = canvas.clientWidth || canvas.width;
+    const h = canvas.clientHeight || canvas.height;
+    const halfW = (w / pxPerMerc) / 2;
+    const halfH = (h / pxPerMerc) / 2;
+
+    // MapLibre bearing: degrees clockwise from north for the camera direction.
+    // To bring the world back to screen-up = north, rotate world by -bearing
+    // around +Z. In our coord system (+Y = south), +bearing should rotate
+    // world clockwise when viewed from above (+Z toward us when looking down).
+    const bearing = map.getBearing() * Math.PI / 180;
+
+    // Build M = ortho * Rz(bearing) * T(-center).
+    const t = new THREE.Matrix4().makeTranslation(-centerMerc.x, -centerMerc.y, 0);
+    const r = new THREE.Matrix4().makeRotationZ(bearing);
+    // top = -halfH because mercator y grows southward — north must land at
+    // clip y = +1.
+    const ortho = new THREE.Matrix4().makeOrthographic(
+      -halfW, halfW, -halfH, halfH, -1e6, 1e6,
+    );
+    return new THREE.Matrix4().multiplyMatrices(ortho, new THREE.Matrix4().multiplyMatrices(r, t));
+  }
+
+  function projectMerc(merc, projMatrix) {
+    const v = new THREE.Vector4(merc.x, merc.y, merc.z, 1).applyMatrix4(projMatrix);
+    if (v.w !== 0) { v.x /= v.w; v.y /= v.w; v.z /= v.w; }
+    const canvas = map.getCanvas();
+    const w = canvas.clientWidth || canvas.width;
+    const h = canvas.clientHeight || canvas.height;
+    return {
+      x: (v.x * 0.5 + 0.5) * w,
+      y: (1 - (v.y * 0.5 + 0.5)) * h,
+      visible: v.z >= -1 && v.z <= 1 && v.w > 0,
+    };
+  }
+
+  function updateLabels(projMatrix) {
+    for (const entry of aircraftEntries.values()) {
+      if (!entry.labelEl) continue;
+      const merc = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
+      const p = projectMerc(merc, projMatrix);
+      if (!p.visible) { entry.labelEl.classList.add('hidden'); continue; }
+      entry.labelEl.classList.remove('hidden');
+      // Anchor: bottom of label sits ~24px above the projected aircraft point.
+      entry.labelEl.style.transform =
+        'translate3d(' + (p.x | 0) + 'px,' + ((p.y - 24) | 0) + 'px,0) translate(-50%, -100%)';
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Aircraft mesh / trail builders
+  // ---------------------------------------------------------------------------
+  // Cache one PlaneGeometry — flat plane at z=0 in XY, facing +Z (up).
+  const ICON_GEOMETRY = new THREE.PlaneGeometry(1, 1);
+  const TRAIL_MATERIAL = new THREE.LineBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.7,
+    depthTest: false, depthWrite: false,
+  });
+  const ALERT_MATERIAL = new THREE.LineDashedMaterial({
+    color: 0xef4444, dashSize: 0.00002, gapSize: 0.00002,
+    transparent: true, opacity: 0.9,
+    depthTest: false, depthWrite: false,
+  });
+
+  function ensureMesh(entry, kind) {
+    const mat = ICON_MATERIALS[kind] || ICON_MATERIALS.plane;
+    if (!mat) return;
+    if (entry.mesh && entry.kind === kind) {
+      entry.mesh.material = mat;
+      return;
+    }
+    if (entry.mesh) entry.group.remove(entry.mesh);
+    const mesh = new THREE.Mesh(ICON_GEOMETRY, mat);
+    // PlaneGeometry lies in the XY plane facing +Z (top-down view). Track
+    // rotation is applied via mesh.rotation.z below; renderOrder ensures the
+    // aircraft draws on top of its trail/alert line.
+    mesh.renderOrder = 3;
+    entry.group.add(mesh);
+    entry.mesh = mesh;
+    entry.kind = kind;
+  }
+
+  function setMeshTrack(entry, trackDeg, rotate) {
+    if (!entry.mesh) return;
+    // Track is compass heading: 0 = north, 90 = east, clockwise. In our world
+    // frame +Y is south so a positive Z-rotation (right-hand rule with +Z up)
+    // rotates the "north-pointing" plane mesh clockwise when viewed from above
+    // — exactly matches compass.
+    const t = (rotate && typeof trackDeg === 'number') ? trackDeg : 0;
+    entry.mesh.rotation.set(0, 0, t * Math.PI / 180);
+  }
+
+  function rebuildTrail(entry, history) {
+    if (entry.trail) {
+      aircraftLayer.trailGroup.remove(entry.trail);
+      entry.trail.geometry.dispose();
+      entry.trail = null;
+    }
+    if (!Array.isArray(history) || history.length < 1) return;
+    // Trail points + current position joined as one polyline.
+    const pts = [];
+    for (const h of history) {
+      const lat = h[0], lon = h[1];
+      const altM = (typeof h[2] === 'number' ? h[2] : 0) * FT_TO_M;
+      const m = maplibregl.MercatorCoordinate.fromLngLat([lon, lat], altM);
+      pts.push(m.x, m.y, m.z);
+    }
+    // Append current.
+    const curM = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
+    pts.push(curM.x, curM.y, curM.z);
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    const line = new THREE.Line(geom, TRAIL_MATERIAL);
+    line.renderOrder = 1;
+    aircraftLayer.trailGroup.add(line);
+    entry.trail = line;
+  }
+
+  function rebuildAlertLine(entry) {
+    if (entry.alertLine) {
+      aircraftLayer.alertGroup.remove(entry.alertLine);
+      entry.alertLine.geometry.dispose();
+      entry.alertLine = null;
+    }
+    if (!entry.alert || !restrictedCenter) return;
+    const a = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
+    const b = maplibregl.MercatorCoordinate.fromLngLat(
+      [restrictedCenter[1], restrictedCenter[0]], 0);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(
+      [a.x, a.y, a.z, b.x, b.y, b.z], 3));
+    const line = new THREE.Line(geom, ALERT_MATERIAL);
+    line.computeLineDistances();
+    line.renderOrder = 2;
+    aircraftLayer.alertGroup.add(line);
+    entry.alertLine = line;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Map load — base GeoJSON layers and overlays
+  // ---------------------------------------------------------------------------
+  map.on('load', async () => {
+    // Center / restricted circles (ground-level overlays).
+    map.addSource('center-src', { type: 'geojson', data: emptyFC() });
+    map.addLayer({ id: 'center-circle', type: 'fill', source: 'center-src',
+      paint: { 'fill-color': '#38bdf8', 'fill-opacity': 0.04 } });
+    map.addLayer({ id: 'center-outline', type: 'line', source: 'center-src',
+      paint: { 'line-color': '#38bdf8', 'line-width': 1 } });
+
+    map.addSource('restricted-src', { type: 'geojson', data: emptyFC() });
+    map.addLayer({ id: 'restricted-fill', type: 'fill', source: 'restricted-src',
+      paint: { 'fill-color': '#ef4444', 'fill-opacity': 0.12 } });
+    map.addLayer({ id: 'restricted-outline', type: 'line', source: 'restricted-src',
+      paint: { 'line-color': '#ef4444', 'line-width': 2 } });
+
+    // Airspaces + airports.
+    try {
+      const [aspResp, aptResp] = await Promise.all([
+        fetch(basePath + '/at_asp.json'),
+        fetch(basePath + '/at_apt.json'),
+      ]);
+      const [aspRows, aptRows] = await Promise.all([aspResp.json(), aptResp.json()]);
+
+      map.addSource('airspaces', { type: 'geojson', data: buildAirspaceGeoJSON(aspRows) });
+      map.addLayer({
+        id: 'airspaces-fill', type: 'fill-extrusion', source: 'airspaces',
+        paint: {
+          'fill-extrusion-color': ['get', 'color'],
+          'fill-extrusion-base':   ['get', 'base'],
+          'fill-extrusion-height': ['get', 'height'],
+          'fill-extrusion-opacity': 0.22,
+        },
+      });
+      map.addLayer({
+        id: 'airspaces-outline', type: 'line', source: 'airspaces',
+        paint: { 'line-color': ['get', 'color'], 'line-width': 1.2, 'line-opacity': 0.7 },
+      });
+
+      map.addSource('airports', { type: 'geojson', data: buildAirportGeoJSON(aptRows) });
+      map.addLayer({
+        id: 'airports-dot', type: 'circle', source: 'airports',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 2.5, 12, 6],
+          'circle-color': ['match', ['get', 'type'],
+            5, '#f59e0b', 3, '#22d3ee', 7, '#22d3ee', '#e2e8f0'],
+          'circle-stroke-color': '#0f172a', 'circle-stroke-width': 1.2,
+        },
+      });
+      map.addLayer({
+        id: 'airports-label', type: 'symbol', source: 'airports', minzoom: 8,
+        layout: {
+          'text-field': ['coalesce', ['get', 'icao'], ['get', 'name']],
+          'text-size': 11, 'text-offset': [0, 0.9], 'text-anchor': 'top',
+          'text-font': ['Open Sans Regular', 'Arial Unicode MS Regular', 'Noto Sans Regular'],
+        },
+        paint: {
+          'text-color': '#e2e8f0',
+          'text-halo-color': '#0f172a', 'text-halo-width': 1.2,
+        },
+      });
+
+      map.on('click', 'airspaces-fill', (e) => {
+        const f = e.features && e.features[0]; if (!f) return;
+        const p = f.properties;
+        new maplibregl.Popup({ closeButton: true }).setLngLat(e.lngLat).setHTML(
+          '<div><b>' + escapeHtml(p.name) + '</b></div>' +
+          '<div>Type: ' + p.type + (p.icaoClass !== undefined ? ' · Class ' + p.icaoClass : '') + '</div>' +
+          '<div>Lower: ' + escapeHtml(p.lowerLabel || '0') + '</div>' +
+          '<div>Upper: ' + escapeHtml(p.upperLabel || '') + '</div>'
+        ).addTo(map);
+      });
+      map.on('mouseenter', 'airspaces-fill', () => { map.getCanvas().style.cursor = 'pointer'; });
+      map.on('mouseleave', 'airspaces-fill', () => { map.getCanvas().style.cursor = ''; });
+      map.on('click', 'airports-dot', (e) => {
+        const f = e.features && e.features[0]; if (!f) return;
+        const p = f.properties;
+        new maplibregl.Popup({ closeButton: true }).setLngLat(f.geometry.coordinates).setHTML(
+          '<div><b>' + escapeHtml(p.name) + '</b>' + (p.icao ? ' (' + escapeHtml(p.icao) + ')' : '') + '</div>' +
+          '<div>Type: ' + escapeHtml(p.typeLabel) + '</div>' +
+          (p.elevation !== null ? '<div>Elevation: ' + p.elevation + ' ft</div>' : '')
+        ).addTo(map);
+      });
+      map.on('mouseenter', 'airports-dot', () => { map.getCanvas().style.cursor = 'pointer'; });
+      map.on('mouseleave', 'airports-dot', () => { map.getCanvas().style.cursor = ''; });
+    } catch (err) {
+      console.error('Failed to load airspace/airport data:', err);
+    }
+
+    // Add the 3D aircraft layer last so it draws on top.
+    map.addLayer(aircraftLayer);
+    // Always repaint so labels and per-frame scaling stay in sync, even on
+    // idle (animated content like the alert flash is implemented via CSS so
+    // we mostly only need repaints when the camera moves — MapLibre already
+    // triggers those itself).
+  });
+
+  function emptyFC() { return { type: 'FeatureCollection', features: [] }; }
+
+  // ---------------------------------------------------------------------------
+  // Snapshot application
+  // ---------------------------------------------------------------------------
+  function circlePolygon(lat, lon, radiusMeters) {
+    const pts = [];
+    const earthR = 6378137;
+    const latRad = lat * Math.PI / 180;
+    for (let i = 0; i <= 64; i++) {
+      const a = (i / 64) * Math.PI * 2;
+      const dx = radiusMeters * Math.cos(a);
+      const dy = radiusMeters * Math.sin(a);
+      const dLat = (dy / earthR) * (180 / Math.PI);
+      const dLon = (dx / (earthR * Math.cos(latRad))) * (180 / Math.PI);
+      pts.push([lon + dLon, lat + dLat]);
+    }
+    return { type: 'Polygon', coordinates: [pts] };
+  }
+
+  function removeEntry(id, entry) {
+    if (entry.group) aircraftLayer.aircraftGroup.remove(entry.group);
+    if (entry.trail) aircraftLayer.trailGroup.remove(entry.trail);
+    if (entry.alertLine) aircraftLayer.alertGroup.remove(entry.alertLine);
+    if (entry.labelEl && entry.labelEl.parentNode) entry.labelEl.parentNode.removeChild(entry.labelEl);
+    if (entry.popup) { try { entry.popup.remove(); } catch (_) {} }
+    aircraftEntries.delete(id);
+    alertedIds.delete(id);
+  }
+
+  function pruneStale() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, entry] of aircraftEntries) {
+      if (now - entry.lastSeen > STALE_MS) { removeEntry(id, entry); changed = true; }
+    }
+    if (changed) map.triggerRepaint();
+  }
+  setInterval(pruneStale, 1000);
+
+  // Alert label flash (2 Hz).
+  let alertFlashOn = false;
+  setInterval(() => {
+    alertFlashOn = !alertFlashOn;
+    for (const id of alertedIds) {
+      const e = aircraftEntries.get(id);
+      if (!e || !e.labelEl) continue;
+      e.labelEl.classList.toggle('alert-on', alertFlashOn);
+    }
+  }, 250);
+
+  function applySnapshot(snap) {
+    if (!layerReady || !map.getLayer('aircraft-3d')) {
+      pendingSnapshot = snap; return;
+    }
+
+    // Centre / radius framing — same as before.
+    if (snap.center && !centerFramed) {
+      centerFramed = true;
+      if (snap.radius_nm) {
+        const meters = snap.radius_nm * 1852;
+        const pad = meters * 1.05;
+        const earthR = 6378137;
+        const latRad = snap.center.lat * Math.PI / 180;
+        const dLat = (pad / earthR) * (180 / Math.PI);
+        const dLon = (pad / (earthR * Math.cos(latRad))) * (180 / Math.PI);
+        map.fitBounds(
+          [[snap.center.lon - dLon, snap.center.lat - dLat],
+           [snap.center.lon + dLon, snap.center.lat + dLat]],
+          { padding: 30, animate: false });
+        map.zoomTo(map.getZoom() + 2, { duration: 0 });
+      } else {
+        map.jumpTo({ center: [snap.center.lon, snap.center.lat] });
+      }
+    }
+    if (snap.center && snap.radius_nm) {
+      const meters = snap.radius_nm * 1852;
+      map.getSource('center-src').setData({
+        type: 'FeatureCollection',
+        features: [{ type: 'Feature',
+          geometry: circlePolygon(snap.center.lat, snap.center.lon, meters), properties: {} }],
+      });
+    }
+
+    if (snap.restricted && typeof snap.restricted.radius_m === 'number') {
+      const r = snap.restricted;
+      restrictedCenter = [r.lat, r.lon];
+      map.getSource('restricted-src').setData({
+        type: 'FeatureCollection',
+        features: [{ type: 'Feature',
+          geometry: circlePolygon(r.lat, r.lon, r.radius_m),
+          properties: { info: 'Restricted: ' + r.radius_m + ' m radius, ≤ ' + r.altitude_ft + ' ft' } }],
+      });
+    }
+
+    const now = Date.now();
+    const list = snap.aircraft || [];
+    for (const ac of list) {
+      if (typeof ac.lat !== 'number' || typeof ac.lon !== 'number') continue;
+      const id = ac.hex || ac.r || ac.flight;
+      if (!id) continue;
+      const lngLat = [ac.lon, ac.lat];
+      const altMeters = aircraftAltMeters(ac);
+      const kind = craftKind(ac);
+      const def = ICON_DEFS[kind] || ICON_DEFS.plane;
+
+      let entry = aircraftEntries.get(id);
+      if (!entry) {
+        const group = new THREE.Group();
+        aircraftLayer.aircraftGroup.add(group);
+
+        const labelEl = document.createElement('div');
+        labelEl.className = 'adsb-label';
+        labelEl.textContent = labelFor(ac);
+        labelsRoot.appendChild(labelEl);
+
+        const popup = new maplibregl.Popup({ offset: 18, closeOnClick: true });
+        labelEl.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          popup.setLngLat(entry.lngLat).setHTML(popupHtml(entry.ac)).addTo(map);
+        });
+
+        entry = {
+          group, mesh: null, kind: null, trail: null, alertLine: null,
+          labelEl, popup, ac,
+          alert: !!ac.mc_alert,
+          lastSeen: now, lngLat, altMeters,
+        };
+        aircraftEntries.set(id, entry);
+      } else {
+        entry.ac = ac;
+        entry.lastSeen = now;
+        entry.lngLat = lngLat;
+        entry.altMeters = altMeters;
+        entry.alert = !!ac.mc_alert;
+        entry.labelEl.textContent = labelFor(ac);
+        if (entry.popup && entry.popup.isOpen()) entry.popup.setHTML(popupHtml(ac));
+      }
+      ensureMesh(entry, kind);
+      setMeshTrack(entry, ac.track, def.rotate);
+      rebuildTrail(entry, ac.mc_history);
+      rebuildAlertLine(entry);
+
+      if (entry.alert) alertedIds.add(id);
+      else { alertedIds.delete(id); entry.labelEl.classList.remove('alert-on'); }
+    }
+
+    pruneStale();
+    map.triggerRepaint();
+    setStatus(true, list.length + ' aircraft · ' + new Date().toLocaleTimeString());
   }
 
   function setStatus(connected, text) {
@@ -316,123 +925,9 @@
     statusText.textContent = text;
   }
 
-  function applySnapshot(snap) {
-    if (snap.center && centerMarker === null) {
-      if (snap.radius_nm) {
-        const bounds = L.latLng(snap.center.lat, snap.center.lon)
-          .toBounds(snap.radius_nm * 1852 * 2);
-        map.fitBounds(bounds, { padding: [20, 20] });
-        map.setZoom(map.getZoom() + 2);
-      } else {
-        map.setView([snap.center.lat, snap.center.lon], map.getZoom());
-      }
-    }
-    if (snap.center) {
-      if (!centerMarker) {
-        centerMarker = L.circleMarker([snap.center.lat, snap.center.lon], {
-          radius: 3.5,
-          color: '#ffffff',
-          weight: 2,
-          fillColor: '#2563eb',
-          fillOpacity: 1,
-          pane: 'markerPane',
-        }).addTo(map);
-        centerMarker.bindTooltip(
-          'Center: ' + snap.center.lat.toFixed(4) + ', ' + snap.center.lon.toFixed(4),
-          { direction: 'top', offset: [0, -8] }
-        );
-      } else {
-        centerMarker.setLatLng([snap.center.lat, snap.center.lon]);
-      }
-      if (snap.radius_nm) {
-        const meters = snap.radius_nm * 1852;
-        if (!radiusCircle) {
-          radiusCircle = L.circle([snap.center.lat, snap.center.lon], {
-            radius: meters, color: '#38bdf8', weight: 1, fillOpacity: 0.04,
-          }).addTo(map);
-        } else {
-          radiusCircle.setLatLng([snap.center.lat, snap.center.lon]);
-          radiusCircle.setRadius(meters);
-        }
-      }
-    }
-
-    if (snap.restricted && typeof snap.restricted.radius_m === 'number') {
-      const r = snap.restricted;
-      restrictedCenter = [r.lat, r.lon];
-      if (!restrictedCircle) {
-        restrictedCircle = L.circle([r.lat, r.lon], {
-          radius: r.radius_m,
-          color: '#ef4444',
-          weight: 2,
-          fillColor: '#ef4444',
-          fillOpacity: 0.12,
-        }).addTo(map);
-        restrictedCircle.bindTooltip(
-          'Restricted: ' + r.radius_m + ' m radius, ≤ ' + r.altitude_ft + ' ft',
-          { direction: 'top', sticky: true }
-        );
-      } else {
-        restrictedCircle.setLatLng([r.lat, r.lon]);
-        restrictedCircle.setRadius(r.radius_m);
-      }
-    }
-
-    const now = Date.now();
-    const seen = new Set();
-    const list = snap.aircraft || [];
-    for (const ac of list) {
-      if (typeof ac.lat !== 'number' || typeof ac.lon !== 'number') continue;
-      const id = ac.hex || ac.r || ac.flight;
-      if (!id) continue;
-      seen.add(id);
-
-      let entry = markers.get(id);
-      const latlng = [ac.lat, ac.lon];
-      const icon = craftIcon(ac);
-      if (!entry) {
-        const marker = L.marker(latlng, { icon: icon, riseOnHover: true })
-          .addTo(map)
-          .bindTooltip(labelFor(ac), { permanent: true, direction: 'top', offset: [0, -16], className: 'adsb-label' })
-          .bindPopup(popupFor(ac));
-        entry = { marker: marker, lastSeen: now, history: [], alert: !!ac.mc_alert };
-        markers.set(id, entry);
-      } else {
-        entry.marker.setLatLng(latlng);
-        entry.marker.setIcon(icon);
-        entry.marker.setTooltipContent(labelFor(ac));
-        if (entry.marker.isPopupOpen()) entry.marker.setPopupContent(popupFor(ac));
-        entry.lastSeen = now;
-        entry.alert = !!ac.mc_alert;
-      }
-      setHistory(entry, ac.mc_history);
-      if (entry.alert) alertedIds.add(id);
-      else alertedIds.delete(id);
-
-      if (entry.alert && restrictedCenter) {
-        const pts = [latlng, restrictedCenter];
-        if (!entry.alertLine) {
-          entry.alertLine = L.polyline(pts, {
-            color: '#ef4444',
-            weight: 2,
-            opacity: 0.9,
-            dashArray: '6 6',
-            interactive: false,
-          }).addTo(map);
-        } else {
-          entry.alertLine.setLatLngs(pts);
-        }
-      } else if (entry.alertLine) {
-        map.removeLayer(entry.alertLine);
-        entry.alertLine = null;
-      }
-    }
-
-    pruneStale();
-
-    setStatus(true, list.length + ' aircraft · ' + new Date().toLocaleTimeString());
-  }
-
+  // ---------------------------------------------------------------------------
+  // Websocket
+  // ---------------------------------------------------------------------------
   let ws = null;
   let backoff = 1000;
   function connect() {

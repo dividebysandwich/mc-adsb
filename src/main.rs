@@ -64,8 +64,9 @@ struct AppState {
 struct Trail {
     /// Previously-reported positions, oldest first. The current position is
     /// tracked separately in `last_pos` and is *not* included here.
-    positions: VecDeque<(f64, f64)>,
-    last_pos: Option<(f64, f64)>,
+    /// Tuple is (lat, lon, alt_ft) — altitude in feet, 0 for ground.
+    positions: VecDeque<(f64, f64, f64)>,
+    last_pos: Option<(f64, f64, f64)>,
     last_seen: Instant,
 }
 
@@ -171,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/adsb", get(index))
         .route("/adsb/", get(index))
+        .route("/adsb/at_asp.json", get(airspaces_json))
+        .route("/adsb/at_apt.json", get(airports_json))
         .route("/adsb/ws", get(ws_handler))
         .route("/adsb/snapshot", get(snapshot))
         .route("/adsb/simulate", get(simulate))
@@ -298,6 +301,20 @@ async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn airspaces_json() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../web/at_asp.json"),
+    )
+}
+
+async fn airports_json() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../web/at_apt.json"),
+    )
+}
+
 async fn simulate(State(state): State<AppState>) -> impl IntoResponse {
     let mut guard = state.sim.lock().await;
     *guard = Some(Instant::now());
@@ -343,9 +360,17 @@ async fn update_history(
             last_seen: now,
         });
         trail.last_seen = now;
-        let new_pos = (lat, lon);
+        let alt_ft = match ac.get("alt_baro") {
+            Some(serde_json::Value::String(s)) if s == "ground" => 0.0,
+            Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+            _ => ac
+                .get("alt_geom")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+        };
+        let new_pos = (lat, lon, alt_ft);
         if let Some(prev) = trail.last_pos {
-            if prev != new_pos {
+            if (prev.0, prev.1) != (new_pos.0, new_pos.1) {
                 trail.positions.push_back(prev);
                 while trail.positions.len() > HISTORY_LEN {
                     trail.positions.pop_front();
@@ -357,7 +382,7 @@ async fn update_history(
         let trail_arr: Vec<serde_json::Value> = trail
             .positions
             .iter()
-            .map(|&(la, lo)| serde_json::json!([la, lo]))
+            .map(|&(la, lo, al)| serde_json::json!([la, lo, al]))
             .collect();
         if let Some(obj) = ac.as_object_mut() {
             obj.insert("mc_history".to_string(), serde_json::Value::Array(trail_arr));
