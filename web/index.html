@@ -194,6 +194,11 @@
   // Airspaces + airports
   // ---------------------------------------------------------------------------
   const FT_TO_M = 0.3048;
+  // FL999 ("no upper limit") and similar extreme values would extrude airspaces
+  // to ~30 km, dwarfing everything else and making the view unreadable. Cap any
+  // upper limit at FL400 (~12 km) for visualization. The label still shows the
+  // raw FL value in the popup.
+  const AIRSPACE_TOP_CAP_M = 400 * 100 * FT_TO_M;
   function vertToMeters(v) {
     if (!v || typeof v.value !== 'number') return 0;
     switch (v.unit) {
@@ -219,8 +224,14 @@
     for (const a of rows) {
       const g = a.geometry;
       if (!g || g.type !== 'Polygon') continue;
-      const base = vertToMeters(a.lowerLimit);
-      const top  = vertToMeters(a.upperLimit);
+      const baseRaw = vertToMeters(a.lowerLimit);
+      const topRaw  = vertToMeters(a.upperLimit);
+      // Cap top to avoid the FL999 "unlimited" overrunning the scene.
+      const top = Math.min(topRaw, AIRSPACE_TOP_CAP_M);
+      // Lift the base by 1 m so adjacent altitude bands of an identical
+      // horizontal polygon (e.g. MATZ 0-4500ft + MATZ 4500-6500ft) don't share
+      // a face that z-fights or appears glued together.
+      const base = Math.min(baseRaw + (baseRaw > 0 ? 1 : 0), top - 1);
       features.push({
         type: 'Feature', geometry: g,
         properties: {
@@ -485,18 +496,25 @@
       const matrix = Array.isArray(args) ? args : (args && args.defaultProjectionData && args.defaultProjectionData.mainMatrix) || args;
 
       const pitch = map.getPitch();
+      let arr;
       if (pitch < ORTHO_PITCH_EPS) {
-        this.camera.projectionMatrix = buildOrthoMatrix();
+        // Orthographic: take MapLibre's matrix verbatim and zero its
+        // perspective row so the divide-by-W disappears. This keeps every
+        // other transform (bearing, Y-flip, zoom, pan) byte-identical to the
+        // perspective path, which means on-screen orientation — including
+        // mesh rotation direction — matches exactly.
+        arr = Array.prototype.slice.call(matrix);
+        arr[3] = 0; arr[7] = 0; arr[11] = 0; arr[15] = 1;
       } else {
-        const m = new THREE.Matrix4().fromArray(matrix);
-        this.camera.projectionMatrix = m;
+        arr = matrix;
       }
+      this.camera.projectionMatrix = new THREE.Matrix4().fromArray(arr);
       this.camera.projectionMatrixInverse = new THREE.Matrix4().copy(this.camera.projectionMatrix).invert();
 
-      // Scale aircraft meshes to roughly 32 px on screen, independent of zoom.
+      // Scale aircraft meshes to roughly 8 px on screen, independent of zoom.
       // metersPerPixel at map center is a reasonable global approximation.
       const mpp = metersPerPixel();
-      const pixelSize = 36;
+      const pixelSize = 8;
       const meterScale = mpp * pixelSize;
       for (const entry of aircraftEntries.values()) {
         if (!entry.mesh) continue;
@@ -521,36 +539,6 @@
   function metersPerPixel() {
     const lat = map.getCenter().lat;
     return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, map.getZoom());
-  }
-
-  // Orthographic projection matrix matching the map's current centre / zoom
-  // / bearing. Z is squashed away — every altitude renders at its true lat/lon.
-  function buildOrthoMatrix() {
-    const center = map.getCenter();
-    const centerMerc = maplibregl.MercatorCoordinate.fromLngLat(center, 0);
-    const zoom = map.getZoom();
-    const pxPerMerc = Math.pow(2, zoom) * 512;
-    const canvas = map.getCanvas();
-    const w = canvas.clientWidth || canvas.width;
-    const h = canvas.clientHeight || canvas.height;
-    const halfW = (w / pxPerMerc) / 2;
-    const halfH = (h / pxPerMerc) / 2;
-
-    // MapLibre bearing: degrees clockwise from north for the camera direction.
-    // To bring the world back to screen-up = north, rotate world by -bearing
-    // around +Z. In our coord system (+Y = south), +bearing should rotate
-    // world clockwise when viewed from above (+Z toward us when looking down).
-    const bearing = map.getBearing() * Math.PI / 180;
-
-    // Build M = ortho * Rz(bearing) * T(-center).
-    const t = new THREE.Matrix4().makeTranslation(-centerMerc.x, -centerMerc.y, 0);
-    const r = new THREE.Matrix4().makeRotationZ(bearing);
-    // top = -halfH because mercator y grows southward — north must land at
-    // clip y = +1.
-    const ortho = new THREE.Matrix4().makeOrthographic(
-      -halfW, halfW, -halfH, halfH, -1e6, 1e6,
-    );
-    return new THREE.Matrix4().multiplyMatrices(ortho, new THREE.Matrix4().multiplyMatrices(r, t));
   }
 
   function projectMerc(merc, projMatrix) {
@@ -698,10 +686,10 @@
       map.addLayer({
         id: 'airspaces-fill', type: 'fill-extrusion', source: 'airspaces',
         paint: {
-          'fill-extrusion-color': ['get', 'color'],
-          'fill-extrusion-base':   ['get', 'base'],
-          'fill-extrusion-height': ['get', 'height'],
-          'fill-extrusion-opacity': 0.22,
+          'fill-extrusion-color':  ['get', 'color'],
+          'fill-extrusion-base':   ['to-number', ['get', 'base']],
+          'fill-extrusion-height': ['to-number', ['get', 'height']],
+          'fill-extrusion-opacity': 0.18,
         },
       });
       map.addLayer({
