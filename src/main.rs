@@ -174,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/adsb/", get(index))
         .route("/adsb/at_asp.json", get(airspaces_json))
         .route("/adsb/at_apt.json", get(airports_json))
+        .route("/adsb/at_border.json", get(border_json))
         .route("/adsb/ws", get(ws_handler))
         .route("/adsb/snapshot", get(snapshot))
         .route("/adsb/simulate", get(simulate))
@@ -312,6 +313,13 @@ async fn airports_json() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         include_str!("../web/at_apt.json"),
+    )
+}
+
+async fn border_json() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../web/at_border.json"),
     )
 }
 
