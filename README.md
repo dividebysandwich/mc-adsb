@@ -1,9 +1,10 @@
 # mc-adsb
 
 ADS-B visualization for an RC club. A small Rust service polls
-[adsb.lol](https://adsb.lol) for traffic around a fixed point and rebroadcasts
-it to a browser over a WebSocket, together with a configurable cylindrical
-restricted area and per-aircraft trajectory-intrusion alerts.
+[adsb.lol](https://adsb.lol) or [airplanes.live](https://airplanes.live) for
+traffic around a fixed point and rebroadcasts it to a browser over a
+WebSocket, together with a configurable cylindrical restricted area and
+per-aircraft trajectory-intrusion alerts.
 
 ## Run
 
@@ -15,9 +16,10 @@ Useful flags (also available as env vars, see `--help`):
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
+| `--source` | `adsb.lol` | Upstream data source: `adsb.lol` or `airplanes.live` |
 | `--lat` / `--lon` | 48.2082 / 16.3738 | Center of the search and the restricted area |
-| `--radius` | 100 | adsb.lol query radius (nm) |
-| `--poll-interval` | 3 | Seconds between adsb.lol polls |
+| `--radius` | 100 | Upstream query radius (nm) |
+| `--poll-interval` | 3 | Seconds between upstream polls |
 | `--bind` | 0.0.0.0:3008 | HTTP/WebSocket listen address |
 | `--restricted-radius-m` | 500 | Restricted-area radius in meters |
 | `--restricted-alt-ft` | 400 | Restricted-area ceiling in feet (aircraft above are ignored) |

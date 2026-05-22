@@ -9,7 +9,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Notify};
@@ -17,8 +17,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "ADS-B websocket relay backed by adsb.lol")]
+#[command(author, version, about = "ADS-B websocket relay backed by adsb.lol or airplanes.live")]
 struct Args {
+    /// Upstream data source
+    #[arg(long, env = "ADSB_SOURCE", value_enum, default_value_t = Source::AdsbLol)]
+    source: Source,
+
     /// Latitude for the centre of the search area
     #[arg(long, env = "ADSB_LAT", default_value_t = 48.2082)]
     lat: f64,
@@ -27,11 +31,11 @@ struct Args {
     #[arg(long, env = "ADSB_LON", default_value_t = 16.3738)]
     lon: f64,
 
-    /// Search radius in nautical miles (adsb.lol caps this at 250)
+    /// Search radius in nautical miles (both providers cap this at 250)
     #[arg(long, env = "ADSB_RADIUS", default_value_t = 100)]
     radius: u32,
 
-    /// Polling interval in seconds. adsb.lol does not stream, so we poll.
+    /// Polling interval in seconds. Neither provider streams, so we poll.
     #[arg(long, env = "ADSB_POLL_INTERVAL", default_value_t = 3)]
     poll_interval: u64,
 
@@ -50,6 +54,36 @@ struct Args {
     /// How far ahead (seconds) to project each aircraft's trajectory when checking intrusion.
     #[arg(long, env = "ADSB_PREDICT_HORIZON_S", default_value_t = 60.0)]
     predict_horizon_s: f64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Source {
+    #[value(name = "adsb.lol", alias = "adsblol")]
+    AdsbLol,
+    #[value(name = "airplanes.live", alias = "airplaneslive")]
+    AirplanesLive,
+}
+
+impl Source {
+    fn url(&self, lat: f64, lon: f64, radius: u32) -> String {
+        match self {
+            Source::AdsbLol => format!(
+                "https://api.adsb.lol/v2/lat/{}/lon/{}/dist/{}",
+                lat, lon, radius
+            ),
+            Source::AirplanesLive => format!(
+                "https://api.airplanes.live/v2/point/{}/{}/{}",
+                lat, lon, radius
+            ),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Source::AdsbLol => "adsb.lol",
+            Source::AirplanesLive => "airplanes.live",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -150,7 +184,8 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     tracing::info!(
-        "starting mc-adsb: lat={}, lon={}, radius={}nm, poll={}s, bind={}, restricted=(r={}m, alt<={}ft, horizon={}s)",
+        "starting mc-adsb: source={}, lat={}, lon={}, radius={}nm, poll={}s, bind={}, restricted=(r={}m, alt<={}ft, horizon={}s)",
+        args.source.label(),
         args.lat,
         args.lon,
         args.radius,
@@ -200,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn poll_loop(state: AppState) -> anyhow::Result<()> {
-    // Per-request timeout of 1s: adsb.lol is sometimes slow, and the API caps
+    // Per-request timeout of 1s: upstream is sometimes slow, and both APIs cap
     // us at 1 req/sec anyway, so a stuck request must not be allowed to stall
     // or pile up behind subsequent attempts.
     let client = reqwest::Client::builder()
@@ -209,10 +244,10 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
         .build()?;
 
     let interval = Duration::from_secs(state.args.poll_interval.max(1));
-    let url = format!(
-        "https://api.adsb.lol/v2/lat/{}/lon/{}/dist/{}",
-        state.args.lat, state.args.lon, state.args.radius
-    );
+    let url = state
+        .args
+        .source
+        .url(state.args.lat, state.args.lon, state.args.radius);
 
     let restricted = RestrictedArea {
         lat: state.args.lat,
