@@ -544,14 +544,28 @@
       const mpp = metersPerPixel();
       const iconMeterScale = mpp * ICON_PIXEL_SIZE;
       const squareMeterScale = mpp * SQUARE_PIXEL_SIZE;
+      // Square outlines are billboarded toward the camera. In our mercator
+      // frame +X=east, +Y=south, +Z=up. The map's bearing rotates the camera
+      // counter-clockwise around +Z (sign flipped vs. compass because of the
+      // Y-flip), and pitch tilts it forward by `pitch` degrees. Composing
+      // rotateZ(bearing) then rotateX(-pitch) takes the square's default +Z
+      // normal to point back at the camera.
+      const bearingRad = map.getBearing() * Math.PI / 180;
+      const pitchRad = map.getPitch() * Math.PI / 180;
       for (const entry of aircraftEntries.values()) {
         if (!entry.mesh) continue;
         const merc = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
         const mpm = merc.meterInMercatorCoordinateUnits();
         entry.group.position.set(merc.x, merc.y, merc.z);
-        const meterScale = SQUARE_KINDS.has(entry.kind) ? squareMeterScale : iconMeterScale;
+        const isSquare = SQUARE_KINDS.has(entry.kind);
+        const meterScale = isSquare ? squareMeterScale : iconMeterScale;
         const s = meterScale * mpm;
         entry.mesh.scale.set(s, s, s);
+        if (isSquare) {
+          entry.mesh.rotation.set(0, 0, 0);
+          entry.mesh.rotateZ(bearingRad);
+          entry.mesh.rotateX(-pitchRad);
+        }
       }
 
       this.renderer.resetState();
