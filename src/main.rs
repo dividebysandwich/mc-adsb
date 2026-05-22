@@ -12,7 +12,7 @@ use axum::Router;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -59,7 +59,15 @@ struct AppState {
     args: Args,
     sim: Arc<tokio::sync::Mutex<Option<Instant>>>,
     history: Arc<tokio::sync::RwLock<HashMap<String, Trail>>>,
+    /// Timestamp of the most recent `/adsb/snapshot` request. Used by the poll
+    /// loop to keep polling for `IDLE_GRACE` after the last consumer goes away.
+    last_snapshot_request: Arc<tokio::sync::RwLock<Option<Instant>>>,
+    /// Pinged whenever a WS client connects or `/adsb/snapshot` is hit, so a
+    /// paused poll loop resumes immediately instead of waiting on its sleep.
+    wake: Arc<Notify>,
 }
+
+const IDLE_GRACE: Duration = Duration::from_secs(60);
 
 struct Trail {
     /// Previously-reported positions, oldest first. The current position is
@@ -160,6 +168,8 @@ async fn main() -> anyhow::Result<()> {
         args: args.clone(),
         sim: Arc::new(tokio::sync::Mutex::new(None)),
         history: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        last_snapshot_request: Arc::new(tokio::sync::RwLock::new(None)),
+        wake: Arc::new(Notify::new()),
     };
 
     let poller_state = state.clone();
@@ -213,8 +223,33 @@ async fn poll_loop(state: AppState) -> anyhow::Result<()> {
 
     let backoff_max = Duration::from_secs(10);
     let mut backoff = Duration::ZERO;
+    let mut was_idle = false;
 
     loop {
+        let has_ws_clients = state.tx.receiver_count() > 0;
+        let recent_request = state
+            .last_snapshot_request
+            .read()
+            .await
+            .map(|t| t.elapsed() < IDLE_GRACE)
+            .unwrap_or(false);
+
+        if !has_ws_clients && !recent_request {
+            if !was_idle {
+                tracing::info!("polling paused: no websocket clients and no recent snapshot requests");
+                was_idle = true;
+            }
+            state.wake.notified().await;
+            // Re-check on next iteration; a stale permit might wake us spuriously.
+            continue;
+        }
+
+        if was_idle {
+            tracing::info!("polling resumed");
+            was_idle = false;
+            backoff = Duration::ZERO;
+        }
+
         tokio::time::sleep(interval + backoff).await;
         let (ac_upstream, now, total) = match fetch(&client, &url).await {
             Ok(payload) => {
@@ -287,6 +322,8 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
+    *state.last_snapshot_request.write().await = Some(Instant::now());
+    state.wake.notify_one();
     match state.latest.read().await.clone() {
         Some(json) => (
             StatusCode::OK,
@@ -410,6 +447,9 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.tx.subscribe();
+    // A subscriber now exists, so receiver_count() > 0 — wake the poll loop in
+    // case it was paused.
+    state.wake.notify_one();
 
     if let Some(snapshot) = state.latest.read().await.clone() {
         if sender.send(Message::Text(snapshot)).await.is_err() {
