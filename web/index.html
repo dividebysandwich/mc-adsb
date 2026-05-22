@@ -470,9 +470,13 @@
       // Bucket groups so we can recolor/swap easily later if needed.
       this.aircraftGroup = new THREE.Group();
       this.trailGroup = new THREE.Group();
+      this.headingGroup = new THREE.Group();
       this.alertGroup = new THREE.Group();
+      this.restrictedGroup = new THREE.Group();
+      this.scene.add(this.restrictedGroup);
       this.scene.add(this.aircraftGroup);
       this.scene.add(this.trailGroup);
+      this.scene.add(this.headingGroup);
       this.scene.add(this.alertGroup);
 
       // Preload aircraft icon textures.
@@ -534,16 +538,18 @@
       this.camera.projectionMatrix = new THREE.Matrix4().fromArray(arr);
       this.camera.projectionMatrixInverse = new THREE.Matrix4().copy(this.camera.projectionMatrix).invert();
 
-      // Scale aircraft meshes to roughly 8 px on screen, independent of zoom.
-      // metersPerPixel at map center is a reasonable global approximation.
+      // Scale aircraft markers to a fixed pixel size, independent of zoom.
+      // Squares are half the size of SVG icons. metersPerPixel at map center
+      // is a reasonable global approximation.
       const mpp = metersPerPixel();
-      const pixelSize = 8;
-      const meterScale = mpp * pixelSize;
+      const iconMeterScale = mpp * ICON_PIXEL_SIZE;
+      const squareMeterScale = mpp * SQUARE_PIXEL_SIZE;
       for (const entry of aircraftEntries.values()) {
         if (!entry.mesh) continue;
         const merc = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
         const mpm = merc.meterInMercatorCoordinateUnits();
         entry.group.position.set(merc.x, merc.y, merc.z);
+        const meterScale = SQUARE_KINDS.has(entry.kind) ? squareMeterScale : iconMeterScale;
         const s = meterScale * mpm;
         entry.mesh.scale.set(s, s, s);
       }
@@ -595,8 +601,40 @@
   // ---------------------------------------------------------------------------
   // Cache one PlaneGeometry — flat plane at z=0 in XY, facing +Z (up).
   const ICON_GEOMETRY = new THREE.PlaneGeometry(1, 1);
-  const TRAIL_MATERIAL = new THREE.LineBasicMaterial({
-    color: 0xffffff, transparent: true, opacity: 0.7,
+  // Aircraft kinds rendered as a plain white square outline + heading line
+  // instead of an SVG icon. Other kinds (glider, drone, vehicle, tower) keep
+  // their icon.
+  const SQUARE_KINDS = new Set(['plane', 'light', 'heli']);
+  const SQUARE_OUTLINE_GEOMETRY = (() => {
+    // Unit square in the XY plane, four corners — used as a LineLoop so it
+    // renders as an outline, not a fill.
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute([
+      -0.5, -0.5, 0,
+       0.5, -0.5, 0,
+       0.5,  0.5, 0,
+      -0.5,  0.5, 0,
+    ], 3));
+    return g;
+  })();
+  const SQUARE_MATERIAL = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    depthTest: false, depthWrite: false,
+  });
+  // Square aircraft markers are half the size of the icon meshes so the
+  // heading line dominates the visual.
+  const ICON_PIXEL_SIZE = 8;
+  const SQUARE_PIXEL_SIZE = 4;
+  // History trail as discrete dots, not a connecting line. sizeAttenuation:false
+  // keeps each dot at a fixed pixel size regardless of zoom.
+  const HISTORY_DOT_MATERIAL = new THREE.PointsMaterial({
+    color: 0xffffff, size: 4, sizeAttenuation: false,
+    transparent: true, opacity: 0.75,
+    depthTest: false, depthWrite: false,
+  });
+  // Heading line projects the aircraft's predicted 30 s position.
+  const HEADING_MATERIAL = new THREE.LineBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.85,
     depthTest: false, depthWrite: false,
   });
   const ALERT_MATERIAL = new THREE.LineDashedMaterial({
@@ -604,19 +642,35 @@
     transparent: true, opacity: 0.9,
     depthTest: false, depthWrite: false,
   });
+  // Restricted-area cylinder: green by default, red when any aircraft is
+  // currently in alert. The same colors apply to the flat ground fill below.
+  const RESTRICTED_GREEN = '#22c55e';
+  const RESTRICTED_RED = '#ef4444';
+  const RESTRICTED_MATERIAL = new THREE.MeshBasicMaterial({
+    color: 0x22c55e, transparent: true, opacity: 0.22,
+    depthTest: false, depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  let restrictedMesh = null;
+  let restrictedParams = null;
 
   function ensureMesh(entry, kind) {
-    const mat = ICON_MATERIALS[kind] || ICON_MATERIALS.plane;
+    const isSquare = SQUARE_KINDS.has(kind);
+    const mat = isSquare
+      ? SQUARE_MATERIAL
+      : (ICON_MATERIALS[kind] || ICON_MATERIALS.plane);
     if (!mat) return;
     if (entry.mesh && entry.kind === kind) {
       entry.mesh.material = mat;
       return;
     }
     if (entry.mesh) entry.group.remove(entry.mesh);
-    const mesh = new THREE.Mesh(ICON_GEOMETRY, mat);
-    // PlaneGeometry lies in the XY plane facing +Z (top-down view). Track
-    // rotation is applied via mesh.rotation.z below; renderOrder ensures the
-    // aircraft draws on top of its trail/alert line.
+    // PlaneGeometry lies in the XY plane facing +Z (top-down view). Icon
+    // meshes get track rotation applied via mesh.rotation.z; square outlines
+    // do not. renderOrder keeps the marker on top of its trail/alert line.
+    const mesh = isSquare
+      ? new THREE.LineLoop(SQUARE_OUTLINE_GEOMETRY, mat)
+      : new THREE.Mesh(ICON_GEOMETRY, mat);
     mesh.renderOrder = 3;
     entry.group.add(mesh);
     entry.mesh = mesh;
@@ -628,8 +682,10 @@
     // Track is compass heading: 0 = north, 90 = east, clockwise. In our world
     // frame +Y is south so a positive Z-rotation (right-hand rule with +Z up)
     // rotates the "north-pointing" plane mesh clockwise when viewed from above
-    // — exactly matches compass.
-    const t = (rotate && typeof trackDeg === 'number') ? trackDeg : 0;
+    // — exactly matches compass. Square-marker kinds never rotate; their
+    // heading line conveys orientation instead.
+    const apply = rotate && typeof trackDeg === 'number' && !SQUARE_KINDS.has(entry.kind);
+    const t = apply ? trackDeg : 0;
     entry.mesh.rotation.set(0, 0, t * Math.PI / 180);
   }
 
@@ -640,7 +696,8 @@
       entry.trail = null;
     }
     if (!Array.isArray(history) || history.length < 1) return;
-    // Trail points + current position joined as one polyline.
+    // History positions only — the current position is already marked by the
+    // aircraft mesh, so the dots show *where it has been*.
     const pts = [];
     for (const h of history) {
       const lat = h[0], lon = h[1];
@@ -648,16 +705,112 @@
       const m = maplibregl.MercatorCoordinate.fromLngLat([lon, lat], altM);
       pts.push(m.x, m.y, m.z);
     }
-    // Append current.
-    const curM = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
-    pts.push(curM.x, curM.y, curM.z);
-
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-    const line = new THREE.Line(geom, TRAIL_MATERIAL);
-    line.renderOrder = 1;
-    aircraftLayer.trailGroup.add(line);
-    entry.trail = line;
+    const dots = new THREE.Points(geom, HISTORY_DOT_MATERIAL);
+    dots.renderOrder = 1;
+    aircraftLayer.trailGroup.add(dots);
+    entry.trail = dots;
+  }
+
+  // Project a heading line from the current position to where the aircraft
+  // will be in 30 s at its current ground speed. Direction is taken from the
+  // previous → current position vector (most recent history sample) when
+  // available, otherwise the reported `track` angle. Only drawn for the kinds
+  // rendered as plain squares.
+  const HEADING_HORIZON_S = 30;
+  function rebuildHeadingLine(entry) {
+    if (entry.headingLine) {
+      aircraftLayer.headingGroup.remove(entry.headingLine);
+      entry.headingLine.geometry.dispose();
+      entry.headingLine = null;
+    }
+    if (!SQUARE_KINDS.has(entry.kind)) return;
+    const ac = entry.ac;
+    const gsKt = (typeof ac.gs === 'number') ? ac.gs : 0;
+    if (gsKt <= 0) return;
+
+    const cur = maplibregl.MercatorCoordinate.fromLngLat(entry.lngLat, entry.altMeters);
+    const mpm = cur.meterInMercatorCoordinateUnits();
+    const distM = gsKt * 0.514444 * HEADING_HORIZON_S;
+
+    // Direction from previous → current. Mercator Y grows southward, so
+    // (dx, dy) already lives in the same frame as the aircraft mesh.
+    let dx = 0, dy = 0;
+    const hist = ac.mc_history;
+    if (Array.isArray(hist) && hist.length > 0) {
+      const p = hist[hist.length - 1];
+      const prevAlt = (typeof p[2] === 'number' ? p[2] : 0) * FT_TO_M;
+      const prev = maplibregl.MercatorCoordinate.fromLngLat([p[1], p[0]], prevAlt);
+      const ddx = cur.x - prev.x;
+      const ddy = cur.y - prev.y;
+      const len = Math.hypot(ddx, ddy);
+      if (len > 0) { dx = ddx / len; dy = ddy / len; }
+    }
+    if (dx === 0 && dy === 0) {
+      if (typeof ac.track !== 'number') return;
+      const tr = ac.track * Math.PI / 180;
+      dx = Math.sin(tr);     // 90° → +X (east)
+      dy = -Math.cos(tr);    // 0° → -Y (north)
+    }
+
+    const distMerc = distM * mpm;
+    const endX = cur.x + dx * distMerc;
+    const endY = cur.y + dy * distMerc;
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(
+      [cur.x, cur.y, cur.z, endX, endY, cur.z], 3));
+    const line = new THREE.Line(geom, HEADING_MATERIAL);
+    line.renderOrder = 2;
+    aircraftLayer.headingGroup.add(line);
+    entry.headingLine = line;
+  }
+
+  // Build (or rebuild on parameter change) the 3D cylinder visualizing the
+  // restricted volume. Color of the shared material is flipped between
+  // green/red by updateRestrictedAlertState().
+  function buildOrUpdateRestricted(r) {
+    if (!aircraftLayer.restrictedGroup) return;
+    const params = { lat: r.lat, lon: r.lon, radiusM: r.radius_m, altFt: r.altitude_ft };
+    const same = restrictedParams &&
+      restrictedParams.lat === params.lat &&
+      restrictedParams.lon === params.lon &&
+      restrictedParams.radiusM === params.radiusM &&
+      restrictedParams.altFt === params.altFt;
+    if (restrictedMesh && same) return;
+    if (restrictedMesh) {
+      aircraftLayer.restrictedGroup.remove(restrictedMesh);
+      restrictedMesh.geometry.dispose();
+      restrictedMesh = null;
+    }
+    const center = maplibregl.MercatorCoordinate.fromLngLat([params.lon, params.lat], 0);
+    const mpm = center.meterInMercatorCoordinateUnits();
+    const radius = params.radiusM * mpm;
+    // Floor at a small minimum so degenerate inputs don't yield invisible geom.
+    const height = Math.max(params.altFt * FT_TO_M * mpm, mpm * 10);
+    // CylinderGeometry axis is Y; rotate so axis aligns with mercator Z (up).
+    // openEnded:true lets the user see into the volume from above; the ground
+    // MapLibre fill provides the bottom cap.
+    const geom = new THREE.CylinderGeometry(radius, radius, height, 64, 1, true);
+    geom.rotateX(Math.PI / 2);
+    geom.translate(center.x, center.y, height / 2);
+    const mesh = new THREE.Mesh(geom, RESTRICTED_MATERIAL);
+    mesh.renderOrder = -500;
+    aircraftLayer.restrictedGroup.add(mesh);
+    restrictedMesh = mesh;
+    restrictedParams = params;
+  }
+
+  function updateRestrictedAlertState(active) {
+    const hex = active ? RESTRICTED_RED : RESTRICTED_GREEN;
+    RESTRICTED_MATERIAL.color.set(hex);
+    if (map.getLayer('restricted-fill')) {
+      map.setPaintProperty('restricted-fill', 'fill-color', hex);
+    }
+    if (map.getLayer('restricted-outline')) {
+      map.setPaintProperty('restricted-outline', 'line-color', hex);
+    }
   }
 
   function rebuildAlertLine(entry) {
@@ -693,9 +846,9 @@
 
     map.addSource('restricted-src', { type: 'geojson', data: emptyFC() });
     map.addLayer({ id: 'restricted-fill', type: 'fill', source: 'restricted-src',
-      paint: { 'fill-color': '#ef4444', 'fill-opacity': 0.12 } });
+      paint: { 'fill-color': RESTRICTED_GREEN, 'fill-opacity': 0.12 } });
     map.addLayer({ id: 'restricted-outline', type: 'line', source: 'restricted-src',
-      paint: { 'line-color': '#ef4444', 'line-width': 2 } });
+      paint: { 'line-color': RESTRICTED_GREEN, 'line-width': 2 } });
 
     // Airspaces + airports + country border.
     try {
@@ -929,6 +1082,7 @@
   function removeEntry(id, entry) {
     if (entry.group) aircraftLayer.aircraftGroup.remove(entry.group);
     if (entry.trail) aircraftLayer.trailGroup.remove(entry.trail);
+    if (entry.headingLine) aircraftLayer.headingGroup.remove(entry.headingLine);
     if (entry.alertLine) aircraftLayer.alertGroup.remove(entry.alertLine);
     if (entry.labelEl && entry.labelEl.parentNode) entry.labelEl.parentNode.removeChild(entry.labelEl);
     if (entry.popup) { try { entry.popup.remove(); } catch (_) {} }
@@ -942,7 +1096,10 @@
     for (const [id, entry] of aircraftEntries) {
       if (now - entry.lastSeen > STALE_MS) { removeEntry(id, entry); changed = true; }
     }
-    if (changed) map.triggerRepaint();
+    if (changed) {
+      updateRestrictedAlertState(alertedIds.size > 0);
+      map.triggerRepaint();
+    }
   }
   setInterval(pruneStale, 1000);
 
@@ -999,6 +1156,7 @@
           geometry: circlePolygon(r.lat, r.lon, r.radius_m),
           properties: { info: 'Restricted: ' + r.radius_m + ' m radius, ≤ ' + r.altitude_ft + ' ft' } }],
       });
+      buildOrUpdateRestricted(r);
     }
 
     const now = Date.now();
@@ -1047,6 +1205,7 @@
       ensureMesh(entry, kind);
       setMeshTrack(entry, ac.track, def.rotate);
       rebuildTrail(entry, ac.mc_history);
+      rebuildHeadingLine(entry);
       rebuildAlertLine(entry);
 
       if (entry.alert) alertedIds.add(id);
@@ -1054,6 +1213,7 @@
     }
 
     pruneStale();
+    updateRestrictedAlertState(alertedIds.size > 0);
     map.triggerRepaint();
     setStatus(true, list.length + ' aircraft · ' + new Date().toLocaleTimeString());
   }
